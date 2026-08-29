@@ -1,0 +1,5 @@
+# Rust build output (prebuilt binaries are committed under bin/, not target/)
+target/
+
+# OS
+.DS_Store
