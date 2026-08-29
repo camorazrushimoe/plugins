@@ -1,6 +1,6 @@
 # Agent Office — Plugins
 
-A collection of standalone plugins for **Agent Office**, the agent factory.
+A collection of standalone plugins for [**Agent Office**](https://github.com/camorazrushimoe/agent-office), the agent factory.
 Plugins extend what the factory can do **without modifying the factory itself**.
 
 ## What is a plugin?
