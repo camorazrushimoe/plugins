@@ -29,8 +29,24 @@ the factory.
   daemon, ~1 read per second) and processes new events as they appear. It does
   **not** require the factory to push events to it.
 
-  > Open: confirm the exact Redis structure that holds the events
-  > (stream vs list vs keys) and the event schema.
+- **Redis structure (confirmed):** events are held in a Redis **STREAM** at
+  key `office:events` (durable append-only log), mirrored to a pub/sub topic
+  `office:events:topic` for live followers.
+
+- **Activity hooks:** every Agent Office agent publishes two deterministic
+  (no-LLM) gateway hooks that matter here:
+  - `task.started` on `agent:start` — the agent began processing a message;
+  - `task.finished` on `agent:end` — the agent finished a turn.
+  Each is a bus envelope: `actor` = agent id, `team` = team/instance id, and a
+  `payload` with `snippet` (first 200 chars of the message/response), `task_ref`
+  (extracted GitHub issue/PR/Linear refs) and, on finish, `handoff` (other
+  agent ids mentioned).
+
+- **How to find them in Redis:**
+  - `XREVRANGE office:events + - COUNT 20` — newest first;
+  - `XREAD BLOCK 0 STREAMS office:events $` — follow live;
+  - or `python3 crew/office-log.py [--follow]` from the agent-office repo for a
+    human-readable tail.
 
 ## 4. Output
 
