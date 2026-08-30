@@ -1,0 +1,11 @@
+# Copy next to the wfdc binary as `wfdc.toml` and edit the URL.
+# That is the only factory-specific setting.
+
+# Office default host mapping is 6380. A standalone crew may be 6379.
+redis_url = "redis://127.0.0.1:6380"
+
+# Durable Office / crew event stream. Do not point this at pub/sub.
+stream = "office:events"
+
+# Dataset root. Created on first run. One collector per directory.
+data_dir = "./wfdc-data"
