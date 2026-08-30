@@ -2,7 +2,7 @@
 
 **Plugin:** `workflow-data-collector`
 **Binary:** `wfdc`
-**Status:** Draft v0.2
+**Status:** Draft v0.2.1 (adversarial review)
 **Approach:** spec-driven. Implementation follows this file.
 **Ship unit:** one static `musl` binary + one config file next to it.
 **Factory:** not modified. Drop the binary beside a running factory, point the config at Redis, start the process.
@@ -22,8 +22,7 @@ v1 does two things only:
    structured layer).
 
 Workflow interpretation, blocker labels, “unnecessary session”
-verdicts, and chain mining stay in Lab. They can be added to a later
-plugin revision after the first dumps have been looked at.
+verdicts, and chain mining stay in Lab.
 
 ---
 
@@ -40,7 +39,7 @@ No factory rebuild, no hook change, no compose change required.
 The binary is a sidecar: it opens Redis as a client and writes files.
 
 ```toml
-# wfdc.toml — loaded from the binary's directory, then cwd, then --config
+# wfdc.toml — search order: --config, $WFDC_CONFIG, <binary-dir>/wfdc.toml, ./wfdc.toml
 redis_url = "redis://127.0.0.1:6380"
 stream    = "office:events"
 data_dir  = "./wfdc-data"
@@ -48,6 +47,11 @@ data_dir  = "./wfdc-data"
 
 `redis_url` is how a factory on a non-default port is targeted.
 Host, port, password, db index all live in the URL.
+
+A **relative** `data_dir` is resolved against the directory of the
+config file that supplied it; if no config file was used, against the
+binary's directory. Not against the process cwd (cron/systemd often
+start in `/`).
 
 CLI overrides the file when passed:
 
@@ -66,20 +70,23 @@ built-in defaults (`redis://127.0.0.1:6380`, `office:events`,
 
 ## 3. Runtime
 
-- Default command is **follow**: block on the stream, write new
-  entries as they appear. A one-second block timeout is enough;
-  there is no busy-loop.
-- If Redis is down or the stream does not exist: log, wait, retry
-  with backoff. Do not exit. Do not invent events. The gap is
-  visible later as a jump in `stream_id` / timestamps — Lab treats
-  that as missing data.
-- Checkpoint the last successfully flushed Redis stream id in
-  `$data_dir/CHECKPOINT`. After a restart, resume from that id.
-  Events that arrived while the process was dead are not backfilled
-  automatically in v1 (the stream may still hold them; `wfdc backfill`
-  exists for a manual catch-up).
-- One writer per `data_dir` (pid lock file). Lightweight: a few MB
-  RSS, near-zero CPU when the bus is quiet.
+- Default command is **follow**: blocking `XREAD` on the stream
+  (`BLOCK` ~1000 ms, `COUNT` small). No busy-loop.
+- Restart: read `$data_dir/CHECKPOINT` and `XREAD` from that stream
+  id. Events that landed in the stream while the process was dead
+  **are** consumed on resume, as long as Redis still has them.
+  Automatic catch-up is the checkpoint. `wfdc backfill` is only for
+  a chosen range (first install, rebuilt derived tables, or a
+  trimmed stream you recovered elsewhere).
+- A hole in `raw/` appears only when events never reached the
+  stream (hook swallowed a down bus), the stream was trimmed past
+  the checkpoint, or Redis lost data. Do not invent rows to fill it.
+- If Redis is down or the stream key is missing: log, wait, retry
+  with backoff. Do not exit.
+- One writer per `data_dir`. Lock file `$data_dir/.lock` holds pid +
+  started_at. A lock whose pid is not running is stale and is taken
+  over. A live foreign pid → exit code 3.
+- Lightweight: a few MB RSS, near-zero CPU when the bus is quiet.
 
 ```
 wfdc                 # follow
@@ -95,34 +102,49 @@ wfdc status          # checkpoint, last flush, redis reachable?
 Source of truth: Redis **STREAM** at `stream` from the config
 (Office default: `office:events`). Pub/sub is ignored.
 
-Every stream entry is stored raw. v1 session pairing only looks at:
+### 4.1 Wire format (this is what XREAD actually returns)
+
+A stream entry is a flat list of string fields, not a nested JSON
+document. `crew/office-log.py` and `crew/publish-event.py` treat
+these keys as first-class fields:
+
+`action`, `actor`, `target`, `timestamp`, `team`, `project`,
+`summary`, plus whatever else the publisher added.
+
+`office/activity.py` builds a logical envelope (`id`, `actor`,
+`action`, `target`, `timestamp`, `team`, `payload{…}`) via
+`make_envelope` / `publish_event`. On the wire that envelope is
+still string fields. Nested objects (`payload`, `task_ref`) are
+either:
+
+- a JSON string in one field (`payload`, `json`, or `envelope`), or
+- flattened (`snippet`, `session_id`, `summary`, …) next to `action`.
+
+v1 decoder, in order:
+
+1. Read all string fields on the entry.
+2. If `json` or `envelope` is valid JSON object, use it as the
+   envelope and overlay any missing top-level fields from the flat
+   map.
+3. If `payload` is a JSON object string, parse it; otherwise treat
+   known payload keys sitting at the top level (`session_id`,
+   `snippet`, `summary`, `task_ref`, `handoff`) as the payload.
+4. `task_ref` / `handoff` may themselves be JSON strings.
+
+Unknown fields are kept under `fields` on the raw JSONL line so
+Lab can see what the factory actually sent. The plugin never
+requires a factory schema change.
+
+### 4.2 Actions used for pairing
 
 - `task.started`  — agent:start hook
 - `task.finished` — agent:end hook
 
-Any other `action` is kept in the raw log and skipped by the
-assembler. Unknown payload fields are kept as-is.
+Every other `action` is stored raw and ignored by the assembler.
 
-Envelope (already published by the factory, see
-`agent-office/bus/action-schema.json`):
-
-| Field | Use |
-|-------|-----|
-| Redis stream id | order + checkpoint + gap detection |
-| `id` | envelope uuid |
-| `timestamp` | event time (UTC) |
-| `actor` | agent id |
-| `action` | event type |
-| `target` | as published |
-| `team` | instance id (`dev-1`, `lab-1`, `office`, …) |
-| `project` | if present |
-| `payload` | opaque JSON; known keys below |
-
-Known payload keys from the activity hooks: `session_id`, `snippet`,
-`summary`, `task_ref` (`issues` / `prs` / `linear`), `handoff`
-(finish only). Missing keys stay null. They are not guessed.
-
-The plugin never asks the factory to add fields.
+Known payload keys when present: `session_id`, `snippet`, `summary`,
+`task_ref` (`issues` / `prs` / `linear`), `handoff` (finish only).
+Missing keys stay null.
 
 ---
 
@@ -137,102 +159,126 @@ $data_dir/
   raw/
     dt=YYYY-MM-DD/events.jsonl
   teams/
-    <team>/
+    <team_safe>/
       raw/dt=YYYY-MM-DD/events.jsonl
       sessions/dt=YYYY-MM-DD/sessions.jsonl
 ```
 
 - `raw/` is the dataset. Append-only. One JSON object per line.
-- `teams/<team>/` is the same events split by `team` so Lab can
-  take one folder for one factory instance. Empty / missing `team`
-  goes to `_unknown` (or `_office` when the actor is an Office role).
+- `teams/<team_safe>/` is the same events split by `team`.
 - `sessions/` is the only derived table in v1.
 - `dt=` is the UTC date of `timestamp`, falling back to the Redis
-  stream-id clock if the timestamp is unparsable.
+  stream-id millisecond clock if `timestamp` is unparsable.
 
-`MANIFEST.json` records plugin version, `redis_url`, `stream`,
-checkpoint, event/session counts, discovered teams. Rewritten on
-each flush.
+### 5.1 Team folder name
 
-### 5.1 Raw event line
+`team` from the bus is not a safe path.
+
+1. Empty `team`: `_office` if `actor` is one of
+   `architect`, `staff-engineer`, `scrum-master`, `super-devops`,
+   `lifecycle`, `system`; otherwise `_unknown`.
+2. Sanitize: keep `[A-Za-z0-9._-]`, collapse anything else to `_`,
+   strip leading dots, cap at 64 chars. Empty after that → `_unknown`.
+3. Keep the original `team` string on every JSONL row.
+
+### 5.2 Raw event line
 
 ```json
 {
   "stream_id": "1725062400000-0",
-  "envelope_id": "…",
+  "envelope_id": null,
   "ts": "2026-08-30T21:00:00Z",
   "actor": "developer",
   "action": "task.started",
   "target": "developer",
   "team": "dev-1",
   "project": null,
-  "payload": { }
+  "payload": {},
+  "fields": {}
 }
 ```
 
-`payload` is the factory object unchanged.
+`fields` is the raw flat map from Redis (strings). `payload` is
+whatever decoded as payload. `envelope_id` is envelope `id` when
+present.
 
-### 5.2 Session line
+### 5.3 Session line
 
-A session is one agent turn: a `task.started` paired with a later
-`task.finished` on the same correlation key.
+A session is one **agent turn**: one `task.started` paired with a
+later `task.finished`.
 
-Key: `(team, actor, session_id)` when `session_id` is present.
-Otherwise FIFO: match a finish to the oldest unmatched start of
-that `(team, actor)`.
+Hermes `session_id` is a conversation id, not a turn id. Several
+starts for the same agent can share one `session_id`. **Do not**
+use `(team, actor, session_id)` as the primary pairing key — that
+would collapse consecutive turns.
+
+**Pairing (FIFO per agent):**
+
+1. Bucket unmatched starts by `(team, actor)`.
+2. A `task.finished` attaches to the oldest unmatched start in that
+   bucket whose `session_id` is compatible: both empty, or equal.
+   If none match, the finish is `orphan_finish`.
+3. A new `task.started` while that agent already has an unmatched
+   start marks the previous row `interrupted` and opens a new one.
+
+`session_pk` = sha256 of `team|actor|start_stream_id`.
+Stable across rebuilds of the derived table.
 
 | Field | Meaning |
 |-------|---------|
-| `session_pk` | stable hash of the start identity |
-| `team`, `actor`, `session_id` | |
-| `start_stream_id`, `finish_stream_id` | Redis ids; finish may be null |
+| `session_pk` | hash above |
+| `team`, `actor`, `session_id` | as on the start (finish may fill a missing session_id) |
+| `start_stream_id`, `finish_stream_id` | finish null while open |
 | `started_at`, `finished_at` | |
 | `duration_ms` | null while open |
 | `state` | `completed` \| `open` \| `interrupted` \| `orphan_finish` \| `expired` |
-| `snippet_in`, `snippet_out` | from start / finish payload |
+| `snippet_in`, `snippet_out` | start / finish snippet |
 | `issues`, `prs`, `linear` | union of start+finish refs |
 | `handoff` | from finish |
 | `project` | if present on either envelope |
 
 States:
 
-- `completed` — start and finish, in order
+- `completed` — start and compatible finish, in stream-id order
 - `open` — start seen, no finish yet
-- `interrupted` — a new start arrived for the same agent while the
-  previous session was still open
-- `orphan_finish` — finish with no matching start (process started
-  mid-stream, or the start was lost)
-- `expired` — `open` longer than 6 hours (likely a killed container;
-  hooks do not fire on OOM / `docker stop`)
+- `interrupted` — a newer start for the same `(team, actor)` arrived
+  first
+- `orphan_finish` — finish with no compatible unmatched start
+- `expired` — `open` longer than 6 hours (killed container; hooks
+  do not fire on OOM / `docker stop`)
 
 Open rows live on the `dt=` of `started_at` and are upserted when
-they close, even after midnight.
+they close, even after midnight. Upsert = rewrite that day's
+`sessions.jsonl` via `*.tmp` + atomic rename.
 
-This table exists so Lab does not have to re-join start/stop on
-every dump. It is not a workflow model.
+This table exists so Lab does not re-join start/stop on every dump.
+It is not a workflow model.
+
+### 5.4 MANIFEST.json
+
+Rewritten each flush. Must **not** store the Redis password.
+Write `redis_url` with userinfo stripped (`redis://127.0.0.1:6380`,
+never `redis://:secret@…`). Also: plugin version, stream name,
+checkpoint, event/session counts, discovered original team strings.
 
 ---
 
 ## 6. Gaps and honesty
 
-- A Redis outage or a stopped collector leaves a hole in `raw/`.
-  Nothing is synthesized to fill it. `status` and the checkpoint
-  make the hole discoverable.
-- Blockers are not labelled. The factory hooks do not emit
-  `blocked`, and the collector will not regex them out of snippets.
+- A hole is a jump in `stream_id` / time, or `status` showing a
+  checkpoint older than `XINFO STREAM` last-id. Nothing is
+  synthesized to fill it.
+- Blockers are not labelled. Hooks do not emit `blocked`.
 - Snippets are whatever the factory already put on the bus
   (first 200 characters). Stored as-is.
 - Model name, tokens, full prompts are not on the bus today.
-  Out of scope until the factory itself publishes them — this
-  plugin will not require that change.
 
 ---
 
 ## 7. Determinism
 
-Same stream range + same pairing rules → same `session_pk` values.
-Raw files are never rewritten; only appended. Derived session files
-may rewrite the current day via `*.tmp` + atomic rename.
+Same stream range + these pairing rules → same `session_pk` values.
+Raw files are never rewritten; only appended.
 
 ---
 
@@ -243,19 +289,17 @@ may rewrite the current day via `*.tmp` + atomic rename.
 - Dashboards
 - CSV / Parquet
 - LLM
-- Reconstructing multi-agent chains (do this in Lab on top of
-  sessions + `handoff`; promote into the plugin later if it earns
-  its keep)
+- Reconstructing multi-agent chains
 - Creating the Redis stream if it is missing
 
 ---
 
 ## 9. Implementation order
 
-1. Config load (`wfdc.toml` / env / flags) + Redis client.
+1. Config load + path resolution + Redis client.
 2. Follow + checkpoint + `raw/` writer (office-wide and per team).
 3. Session pairing + `sessions.jsonl`.
-4. `MANIFEST.json` + `status`.
+4. `MANIFEST.json` (redacted URL) + `status`.
 5. `backfill`.
 6. musl binary in `workflow-data-collector/bin/`.
 

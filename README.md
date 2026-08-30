@@ -50,4 +50,4 @@ Each plugin folder will contain its source (`src/`) and prebuilt binaries
 
 | Plugin | What it does | Status |
 |--------|--------------|--------|
-| [workflow-data-collector](workflow-data-collector/) | Reads the factory Redis stream and writes a raw JSONL dataset plus paired agent sessions. Lab analyses the files. | Specification v0.2 |
+| [workflow-data-collector](workflow-data-collector/) | Reads the factory Redis stream and writes a raw JSONL dataset plus paired agent sessions. Lab analyses the files. | Specification v0.2.1 |
