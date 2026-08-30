@@ -1,5 +1,4 @@
 # Copy next to the wfdc binary as `wfdc.toml` and edit the URL.
-# That is the only factory-specific setting.
 
 # Office default host mapping is 6380. A standalone crew may be 6379.
 redis_url = "redis://127.0.0.1:6380"
@@ -9,3 +8,8 @@ stream = "office:events"
 
 # Dataset root. Created on first run. One collector per directory.
 data_dir = "./wfdc-data"
+
+# Hard cap on collected JSONL (raw + sessions, all teams).
+# Oldest days are deleted first so the plugin cannot fill the factory disk.
+# Default 500. Set higher (e.g. 1000) if Lab needs a longer window.
+max_mb = 500
