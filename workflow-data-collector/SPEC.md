@@ -2,7 +2,7 @@
 
 **Plugin:** `workflow-data-collector`
 **Binary:** `wfdc`
-**Status:** Draft v0.2.1 (adversarial review)
+**Status:** Draft v0.2.2
 **Approach:** spec-driven. Implementation follows this file.
 **Ship unit:** one static `musl` binary + one config file next to it.
 **Factory:** not modified. Drop the binary beside a running factory, point the config at Redis, start the process.
@@ -43,6 +43,7 @@ The binary is a sidecar: it opens Redis as a client and writes files.
 redis_url = "redis://127.0.0.1:6380"
 stream    = "office:events"
 data_dir  = "./wfdc-data"
+max_mb    = 500
 ```
 
 `redis_url` is how a factory on a non-default port is targeted.
@@ -53,18 +54,23 @@ config file that supplied it; if no config file was used, against the
 binary's directory. Not against the process cwd (cron/systemd often
 start in `/`).
 
+`max_mb` is the hard cap on collected JSONL under `data_dir`.
+Default **500**. Any positive integer is allowed (1000, 2000, …).
+Env `WFDC_MAX_MB` and flag `--max-mb` override the file.
+Values below 16 are treated as 16 so one flush cannot livelock.
+
 CLI overrides the file when passed:
 
 ```
 ./wfdc                  # follow, using wfdc.toml
 ./wfdc --config /path/wfdc.toml
-./wfdc --redis redis://127.0.0.1:6379 --stream office:events
+./wfdc --redis redis://127.0.0.1:6379 --stream office:events --max-mb 1000
 ```
 
 Env vars (`WFDC_REDIS_URL`, `WFDC_STREAM`, `WFDC_DATA_DIR`,
-`WFDC_CONFIG`) also work. Precedence: CLI > env > config file >
-built-in defaults (`redis://127.0.0.1:6380`, `office:events`,
-`./wfdc-data`).
+`WFDC_CONFIG`, `WFDC_MAX_MB`) also work. Precedence: CLI > env >
+config file > built-in defaults (`redis://127.0.0.1:6380`,
+`office:events`, `./wfdc-data`, `500`).
 
 ---
 
@@ -86,13 +92,14 @@ built-in defaults (`redis://127.0.0.1:6380`, `office:events`,
 - One writer per `data_dir`. Lock file `$data_dir/.lock` holds pid +
   started_at. A lock whose pid is not running is stale and is taken
   over. A live foreign pid → exit code 3.
+- After every successful flush, enforce `max_mb` (§5.5).
 - Lightweight: a few MB RSS, near-zero CPU when the bus is quiet.
 
 ```
 wfdc                 # follow
 wfdc follow
 wfdc backfill [--from STREAM_ID] [--to STREAM_ID]
-wfdc status          # checkpoint, last flush, redis reachable?
+wfdc status          # checkpoint, last flush, redis reachable, bytes used / cap?
 ```
 
 ---
@@ -164,7 +171,9 @@ $data_dir/
       sessions/dt=YYYY-MM-DD/sessions.jsonl
 ```
 
-- `raw/` is the dataset. Append-only. One JSON object per line.
+- `raw/` is the dataset. Append-only within a partition. One JSON
+  object per line. Oldest line is at the **start** of the file;
+  new lines are appended at the end.
 - `teams/<team_safe>/` is the same events split by `team`.
 - `sessions/` is the only derived table in v1.
 - `dt=` is the UTC date of `timestamp`, falling back to the Redis
@@ -222,7 +231,8 @@ would collapse consecutive turns.
    start marks the previous row `interrupted` and opens a new one.
 
 `session_pk` = sha256 of `team|actor|start_stream_id`.
-Stable across rebuilds of the derived table.
+Stable across rebuilds of the derived table from the raw that is
+still on disk.
 
 | Field | Meaning |
 |-------|---------|
@@ -259,7 +269,39 @@ It is not a workflow model.
 Rewritten each flush. Must **not** store the Redis password.
 Write `redis_url` with userinfo stripped (`redis://127.0.0.1:6380`,
 never `redis://:secret@…`). Also: plugin version, stream name,
-checkpoint, event/session counts, discovered original team strings.
+checkpoint, event/session counts, discovered original team strings,
+`bytes_used`, `max_mb`.
+
+### 5.5 Disk cap (`max_mb`)
+
+Purpose: a forgotten sidecar must not fill the factory disk.
+
+**What counts toward the cap.** All `*.jsonl` under `data_dir`
+(office `raw/`, per-team `raw/`, `sessions/`).
+`MANIFEST.json`, `CHECKPOINT`, and `.lock` do not count.
+
+**When.** After every successful flush (and at start of `follow`,
+in case the cap was lowered).
+
+**How old data leaves.** JSONL is append-only, so the oldest events
+are the earliest lines / the oldest `dt=` folders — not the tail.
+
+1. Sum JSONL bytes. If `<= max_mb * 1024 * 1024`, stop.
+2. While over the cap and more than one `dt=` date exists: delete
+   the **oldest** date everywhere it appears (`raw/dt=…` and every
+   `teams/*/raw/dt=…`, `teams/*/sessions/dt=…`). Remove empty
+   parent dirs. Log one line per dropped date.
+3. If only today's date remains and it is still over the cap: trim
+   each of today's JSONL files from the **start** (drop oldest
+   complete lines) until the tree is under the cap, or the file
+   would have fewer than one line left. Rewrite via `*.tmp` +
+   atomic rename. Never emit a partial JSON line.
+
+Checkpoint is **not** moved backward. Dropped rows are a visible
+gap for Lab (`status` reports `bytes_used` vs cap). Redis itself
+is not trimmed.
+
+`0` or a missing key → default 500. Negative → default 500.
 
 ---
 
@@ -267,7 +309,8 @@ checkpoint, event/session counts, discovered original team strings.
 
 - A hole is a jump in `stream_id` / time, or `status` showing a
   checkpoint older than `XINFO STREAM` last-id. Nothing is
-  synthesized to fill it.
+  synthesized to fill it. Hitting `max_mb` also drops the oldest
+  on-disk rows; that is intentional, not a collector crash.
 - Blockers are not labelled. Hooks do not emit `blocked`.
 - Snippets are whatever the factory already put on the bus
   (first 200 characters). Stored as-is.
@@ -277,8 +320,10 @@ checkpoint, event/session counts, discovered original team strings.
 
 ## 7. Determinism
 
-Same stream range + these pairing rules → same `session_pk` values.
-Raw files are never rewritten; only appended.
+Same stream range + these pairing rules → same `session_pk` values,
+for the raw that is still on disk. Within a partition, raw files
+are append-only until the cap trims the oldest date or the start
+of today's file.
 
 ---
 
@@ -291,6 +336,7 @@ Raw files are never rewritten; only appended.
 - LLM
 - Reconstructing multi-agent chains
 - Creating the Redis stream if it is missing
+- Time-based retention (days). Cap is size-only.
 
 ---
 
@@ -299,9 +345,10 @@ Raw files are never rewritten; only appended.
 1. Config load + path resolution + Redis client.
 2. Follow + checkpoint + `raw/` writer (office-wide and per team).
 3. Session pairing + `sessions.jsonl`.
-4. `MANIFEST.json` (redacted URL) + `status`.
-5. `backfill`.
-6. musl binary in `workflow-data-collector/bin/`.
+4. `max_mb` enforcement after flush.
+5. `MANIFEST.json` (redacted URL) + `status`.
+6. `backfill`.
+7. musl binary in `workflow-data-collector/bin/`.
 
 ---
 
