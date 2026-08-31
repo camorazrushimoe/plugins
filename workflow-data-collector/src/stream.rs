@@ -41,6 +41,10 @@ pub trait StreamSource {
         block_ms: u64,
         count: usize,
     ) -> Result<Vec<StreamEntry>, StreamError>;
+
+    /// Whether the stream key exists (§3: a missing key is logged and
+    /// retried with backoff, like Redis being down — never a silent idle).
+    fn stream_exists(&mut self, stream: &str) -> Result<bool, StreamError>;
 }
 
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -110,6 +114,22 @@ impl StreamSource for RedisStream {
         }
         Ok(out)
     }
+
+    fn stream_exists(&mut self, stream: &str) -> Result<bool, StreamError> {
+        let result = self.ensure_conn().and_then(|conn| {
+            redis::cmd("EXISTS")
+                .arg(stream)
+                .query::<i64>(conn)
+                .map_err(|e| StreamError::Unavailable(format!("exists: {e}")))
+        });
+        match result {
+            Ok(n) => Ok(n > 0),
+            Err(e) => {
+                self.conn = None;
+                Err(e)
+            }
+        }
+    }
 }
 
 /// Convert a redis `Value` (always a bulk string for stream fields) to String.
@@ -127,6 +147,9 @@ fn redis_string(v: &redis::Value) -> String {
 #[cfg(test)]
 pub struct FakeSource {
     queue: std::collections::VecDeque<Result<Vec<StreamEntry>, StreamError>>,
+    /// Per-read `stream_exists` answers; falls back to the last answer.
+    exists_queue: std::collections::VecDeque<bool>,
+    exists_default: bool,
 }
 
 #[cfg(test)]
@@ -141,10 +164,16 @@ impl FakeSource {
     pub fn new() -> Self {
         FakeSource {
             queue: std::collections::VecDeque::new(),
+            exists_queue: std::collections::VecDeque::new(),
+            exists_default: true,
         }
     }
     pub fn push(&mut self, r: Result<Vec<StreamEntry>, StreamError>) {
         self.queue.push_back(r);
+    }
+    /// Script the next `stream_exists` answer (§3 missing-key scenario).
+    pub fn push_exists(&mut self, exists: bool) {
+        self.exists_queue.push_back(exists);
     }
     pub fn drained(&self) -> bool {
         self.queue.is_empty()
@@ -170,5 +199,15 @@ impl StreamSource for FakeSource {
         _count: usize,
     ) -> Result<Vec<StreamEntry>, StreamError> {
         self.queue.pop_front().unwrap_or_else(|| Ok(Vec::new()))
+    }
+
+    fn stream_exists(&mut self, _stream: &str) -> Result<bool, StreamError> {
+        match self.exists_queue.pop_front() {
+            Some(v) => {
+                self.exists_default = v;
+                Ok(v)
+            }
+            None => Ok(self.exists_default),
+        }
     }
 }

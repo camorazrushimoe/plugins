@@ -139,10 +139,34 @@ pub fn step<S: StreamSource>(
 ) -> Result<Step, Error> {
     match source.xread(stream, checkpoint, opts.block_ms, opts.count) {
         Ok(entries) => {
-            backoff.reset();
             if entries.is_empty() {
-                return Ok(Step::Idle);
+                // §3: distinguish a quiet existing stream (idle, backoff
+                // reset) from a missing stream key (log + backoff, like Redis
+                // being down — never a silent idle, never an exit).
+                match source.stream_exists(stream) {
+                    Ok(true) => {
+                        backoff.reset();
+                        return Ok(Step::Idle);
+                    }
+                    Ok(false) => {
+                        let wait = backoff.next_wait();
+                        log::warn!(
+                            "stream key {stream:?} is missing — retrying in {} ms (checkpoint unchanged at {checkpoint})",
+                            wait.as_millis()
+                        );
+                        return Ok(Step::BackingOff(wait));
+                    }
+                    Err(e) => {
+                        let wait = backoff.next_wait();
+                        log::warn!(
+                            "stream check failed: {e} — retrying in {} ms",
+                            wait.as_millis()
+                        );
+                        return Ok(Step::BackingOff(wait));
+                    }
+                }
             }
+            backoff.reset();
             let mut fresh: Vec<_> = Vec::with_capacity(entries.len());
             for e in entries {
                 if !should_skip(&e.id, checkpoint)? {
@@ -406,7 +430,7 @@ mod tests {
         let mut store = Store::open(dir.path()).unwrap();
         let mut src = FakeSource::new();
         src.push(Err(StreamError::Unavailable("down".into())));
-        src.push(Ok(vec![])); // empty read = success → backoff reset
+        src.push(Ok(vec![])); // empty read on an existing stream = success → backoff reset
         src.push(Ok(vec![entry("1-0")]));
         let mut waits = Vec::new();
         let steps = drive(&mut src, &mut store, "0", &mut waits).unwrap();
@@ -415,6 +439,50 @@ mod tests {
         assert_eq!(steps[2], Step::Flushed(1));
         assert_eq!(waits, vec![1000], "only the error waited");
         assert_eq!(checkpoint::read(dir.path()).unwrap(), "1-0");
+    }
+
+    #[test]
+    fn missing_stream_key_logs_and_backs_off_never_idles() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let mut src = FakeSource::new();
+        src.push_exists(false);
+        src.push(Ok(vec![])); // empty read, key missing
+        src.push_exists(false);
+        src.push(Ok(vec![])); // still missing
+        src.push_exists(false);
+        src.push(Ok(vec![])); // still missing
+        src.push_exists(true);
+        src.push(Ok(vec![])); // key appears → idle
+        src.push(Ok(vec![entry("1-0")]));
+        let mut waits = Vec::new();
+        let steps = drive(&mut src, &mut store, "0", &mut waits).unwrap();
+        assert_eq!(
+            steps[0..3],
+            [
+                Step::BackingOff(Duration::from_millis(1000)),
+                Step::BackingOff(Duration::from_millis(2000)),
+                Step::BackingOff(Duration::from_millis(4000)),
+            ],
+            "missing key → 1s→2s→4s backoff"
+        );
+        assert_eq!(steps[3], Step::Idle, "key appeared → quiet idle");
+        assert_eq!(steps[4], Step::Flushed(1));
+        assert_eq!(waits, vec![1000, 2000, 4000]);
+        assert_eq!(checkpoint::read(dir.path()).unwrap(), "1-0");
+    }
+
+    #[test]
+    fn missing_stream_key_never_advances_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let mut src = FakeSource::new();
+        src.push_exists(false);
+        src.push(Ok(vec![]));
+        let mut waits = Vec::new();
+        drive(&mut src, &mut store, "0", &mut waits).unwrap();
+        assert_eq!(checkpoint::read(dir.path()).unwrap(), "0");
+        assert!(lines_in(dir.path()).is_empty());
     }
 
     #[test]
