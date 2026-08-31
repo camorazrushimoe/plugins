@@ -1,0 +1,141 @@
+//! wfdc binary entry point.
+//!
+//! Wires config (§2) → permissions → single-writer lock (§3.3) → startup
+//! repair (§3.2) → checkpoint resume (§3.1) → follow loop (§3) with
+//! SIGTERM/SIGINT graceful stop (§3.4 signal path). Exit codes: 0 clean stop,
+//! 1 fatal config/IO, 3 lock conflict.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use wfdc::cli;
+use wfdc::config::{Config, Sources};
+use wfdc::follow::{self, FollowOptions};
+use wfdc::lock::{self, LockError};
+use wfdc::raw::Store;
+use wfdc::stream::RedisStream;
+use wfdc::Error;
+
+fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let code = match real_main() {
+        Ok(()) => 0,
+        Err(e) => {
+            log::error!("{e}");
+            wfdc::exit_code(&e)
+        }
+    };
+    std::process::exit(code);
+}
+
+fn real_main() -> Result<(), Error> {
+    // --- CLI / env / config ---------------------------------------------------
+    let args: Vec<String> = std::env::args().collect();
+    let cli = cli::parse(args.iter().cloned()).map_err(Error::Config)?;
+    if cli.help {
+        print!("{}", cli::USAGE);
+        return Ok(());
+    }
+    let env: BTreeMap<String, String> = std::env::vars().collect();
+    let binary_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| binary_dir.clone());
+    let cfg = Config::load(&Sources {
+        cli: &cli,
+        env: &env,
+        binary_dir: &binary_dir,
+        cwd: &cwd,
+    })
+    .map_err(|e| Error::Config(e.0))?;
+
+    log::info!(
+        "wfdc starting: stream={} data_dir={} redis_url={} max_mb={} expire_hours={}",
+        cfg.stream,
+        cfg.data_dir.display(),
+        cfg.redis_url,
+        cfg.max_mb,
+        cfg.expire_hours
+    );
+
+    // --- store, perms (§2: data_dir 0700, files 0600), single-writer lock ----
+    let mut store = Store::open(&cfg.data_dir)?;
+    let _lock = lock::acquire(&cfg.data_dir).map_err(|e| match e {
+        LockError::Busy => Error::LockBusy,
+        LockError::Io(m) => Error::Io(m),
+    })?;
+
+    // §3.2 startup repair: drop partial lines at EOF before reading anything.
+    let repairs = store.repair_partial_lines()?;
+    for r in &repairs {
+        log::warn!(
+            "startup repair: truncated partial line at {} ({} bytes dropped)",
+            r.path.display(),
+            r.bytes_dropped
+        );
+    }
+
+    // §3.1 resume from CHECKPOINT; a fresh data_dir starts at "0" so the full
+    // retained stream history is caught up (never silently start at "$").
+    let checkpoint = wfdc::checkpoint::read(&cfg.data_dir)?;
+    log::info!("resuming from checkpoint {checkpoint}");
+
+    // --- signals: 1st SIGTERM/SIGINT → clean stop, 2nd → immediate exit 1 ---
+    let stop = Arc::new(AtomicBool::new(false));
+    let signal_stop = Arc::clone(&stop);
+    let main_thread = std::thread::current();
+    let mut signals = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGINT,
+    ])
+    .map_err(|e| Error::Io(format!("cannot install signal handlers: {e}")))?;
+    std::thread::spawn(move || {
+        let mut count = 0usize;
+        for _ in signals.forever() {
+            count += 1;
+            if count == 1 {
+                log::info!(
+                    "signal received — finishing the in-flight batch, then clean stop \
+                     (a second signal exits immediately)"
+                );
+                signal_stop.store(true, Ordering::Relaxed);
+                main_thread.unpark();
+            } else {
+                log::warn!("second signal — exiting immediately with 1");
+                std::process::exit(1);
+            }
+        }
+    });
+
+    // --- follow ----------------------------------------------------------------
+    let mut redis = RedisStream::new(&cfg.redis_url)?;
+    let opts = FollowOptions::default();
+    let mut sleep = |dur: Duration| {
+        // park in slices so the signal handler can unpark us promptly; never
+        // sleep past a graceful-stop request.
+        let deadline = std::time::Instant::now() + dur;
+        while !stop.load(Ordering::Relaxed) {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            std::thread::park_timeout(deadline - now);
+        }
+    };
+    follow::run(
+        &mut redis,
+        &cfg.stream,
+        &mut store,
+        &checkpoint,
+        &opts,
+        &stop,
+        &mut sleep,
+    )?;
+
+    log::info!("clean stop (checkpoint durable)");
+    Ok(())
+}

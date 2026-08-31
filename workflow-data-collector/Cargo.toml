@@ -1,0 +1,29 @@
+[package]
+name = "wfdc"
+version = "0.3.0"
+edition = "2021"
+description = "Workflow Data Collector — follow the factory Redis stream and write a raw JSONL dataset (SPEC.md v0.3.0)"
+license = "MIT"
+
+[[bin]]
+name = "wfdc"
+path = "src/main.rs"
+
+[dependencies]
+redis = "1"
+toml = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+log = "0.4"
+env_logger = "0.11"
+signal-hook = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+strip = true
+lto = true
+codegen-units = 1
