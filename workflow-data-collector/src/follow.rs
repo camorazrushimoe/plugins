@@ -11,7 +11,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::decode;
+use crate::pairing::Pairer;
 use crate::raw::{Store, WriteEntry};
+use crate::sessions::SessionStore;
 use crate::stream::StreamSource;
 use crate::team;
 use crate::Error;
@@ -107,7 +109,10 @@ pub enum Step {
 
 /// One iteration of the follow loop. `checkpoint` (the in-memory watermark)
 /// advances only inside `Flushed`, after the batch is durable (§3.1 order:
-/// write → fsync JSONL → atomic CHECKPOINT → advance).
+/// write → fsync JSONL → atomic CHECKPOINT → advance). Every decoded
+/// `task.started` / `task.finished` is fed to `pairer` (§5.3); the session
+/// upserts and expiry aging run in [`run`] on every iteration, including
+/// empty rounds.
 pub fn step<S: StreamSource>(
     source: &mut S,
     stream: &str,
@@ -115,6 +120,7 @@ pub fn step<S: StreamSource>(
     store: &mut Store,
     opts: &FollowOptions,
     backoff: &mut Backoff,
+    pairer: &mut Pairer,
 ) -> Result<Step, Error> {
     match source.xread(stream, checkpoint, opts.block_ms, opts.count) {
         Ok(entries) => {
@@ -167,6 +173,9 @@ pub fn step<S: StreamSource>(
                         reason
                     );
                 }
+                // §5.3: only task.started / task.finished pair; every other
+                // action is ignored by the assembler.
+                pairer.ingest(&decoded)?;
                 write_entries.push(WriteEntry {
                     team_safe: team::team_safe(
                         decoded.line.team.as_deref(),
@@ -201,7 +210,11 @@ pub fn step<S: StreamSource>(
 
 /// Run the follow loop until `stop` is set. `sleep` is injected so tests can
 /// record waits without sleeping; the production closure parks in short
-/// slices so a signal interrupts promptly.
+/// slices so a signal interrupts promptly. `now` is the wall clock for §5.3
+/// expiry; it is injected so tests can drive time. After **every** read
+/// iteration — including empty rounds — the pairing pool is aged and the
+/// affected `sessions.jsonl` partitions are upserted (§5.3).
+#[allow(clippy::too_many_arguments)] // the follow loop's collaborators are all distinct seams (§2/§3/§5.3)
 pub fn run<S: StreamSource>(
     source: &mut S,
     stream: &str,
@@ -210,6 +223,9 @@ pub fn run<S: StreamSource>(
     opts: &FollowOptions,
     stop: &AtomicBool,
     sleep: &mut dyn FnMut(Duration),
+    pairer: &mut Pairer,
+    session_store: &SessionStore,
+    now: &mut dyn FnMut() -> chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Error> {
     let mut checkpoint = initial_checkpoint.to_string();
     let mut backoff = Backoff::new(opts.jitter);
@@ -218,10 +234,23 @@ pub fn run<S: StreamSource>(
             log::info!("stop requested — clean exit at checkpoint {checkpoint}");
             return Ok(());
         }
-        match step(source, stream, &mut checkpoint, store, opts, &mut backoff)? {
+        match step(
+            source,
+            stream,
+            &mut checkpoint,
+            store,
+            opts,
+            &mut backoff,
+            pairer,
+        )? {
             Step::Idle | Step::Flushed(_) => {}
             Step::BackingOff(wait) => sleep(wait),
         }
+        // §5.3: expiry aging on every read iteration, incl. empty rounds; the
+        // upsert rewrites each touched day's sessions.jsonl atomically.
+        pairer.age(now());
+        let writes = pairer.take_writes();
+        session_store.upsert(&writes)?;
     }
 }
 
@@ -277,9 +306,18 @@ mod tests {
         };
         let mut cp = initial_cp.to_string();
         let mut backoff = Backoff::new(false);
+        let mut pairer = Pairer::new(6);
         let mut steps = Vec::new();
         loop {
-            let s = step(src, "office:events", &mut cp, store, &opts, &mut backoff)?;
+            let s = step(
+                src,
+                "office:events",
+                &mut cp,
+                store,
+                &opts,
+                &mut backoff,
+                &mut pairer,
+            )?;
             if let Step::BackingOff(w) = &s {
                 waits.push(w.as_millis() as u64)
             }
@@ -572,6 +610,9 @@ mod tests {
             })
         };
         let mut sleeper = |_: Duration| panic!("no errors → sleeper must not run");
+        let mut pairer = Pairer::new(6);
+        let session_store = SessionStore::new(dir.path());
+        let mut now = || chrono::Utc::now();
         run(
             &mut src,
             "office:events",
@@ -583,6 +624,9 @@ mod tests {
             },
             &stop,
             &mut sleeper,
+            &mut pairer,
+            &session_store,
+            &mut now,
         )
         .unwrap();
         stopper.join().unwrap();
@@ -597,6 +641,9 @@ mod tests {
         src.push(Err(StreamError::Unavailable("down".into())));
         let stop = AtomicBool::new(false);
         let mut sleeper = |_: Duration| stop.store(true, Ordering::Relaxed);
+        let mut pairer = Pairer::new(6);
+        let session_store = SessionStore::new(dir.path());
+        let mut now = || chrono::Utc::now();
         run(
             &mut src,
             "office:events",
@@ -608,6 +655,9 @@ mod tests {
             },
             &stop,
             &mut sleeper,
+            &mut pairer,
+            &session_store,
+            &mut now,
         )
         .unwrap();
         assert_eq!(checkpoint::read(dir.path()).unwrap(), "0");
@@ -620,6 +670,9 @@ mod tests {
         let mut src = FakeSource::new();
         let stop = AtomicBool::new(true);
         let mut sleeper = |_: Duration| panic!("must not sleep when stopping");
+        let mut pairer = Pairer::new(6);
+        let session_store = SessionStore::new(dir.path());
+        let mut now = || chrono::Utc::now();
         run(
             &mut src,
             "office:events",
@@ -631,6 +684,9 @@ mod tests {
             },
             &stop,
             &mut sleeper,
+            &mut pairer,
+            &session_store,
+            &mut now,
         )
         .unwrap();
         assert!(lines_in(dir.path()).is_empty());
