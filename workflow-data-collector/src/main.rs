@@ -81,8 +81,29 @@ fn real_main() -> Result<(), Error> {
 
     // §3.1 resume from CHECKPOINT; a fresh data_dir starts at "0" so the full
     // retained stream history is caught up (never silently start at "$").
-    let checkpoint = wfdc::checkpoint::read(&cfg.data_dir)?;
-    log::info!("resuming from checkpoint {checkpoint}");
+    let durable = wfdc::checkpoint::read(&cfg.data_dir)?;
+    // A crash between appending a batch and writing CHECKPOINT leaves rows on
+    // disk ahead of the durable checkpoint; resume from the max written id so
+    // the at-least-once re-read cannot duplicate them (§3.1).
+    let max_written = store.max_written_stream_id()?;
+    let start = wfdc::checkpoint::resume_start(&durable, max_written.as_deref());
+    let recovered = max_written.as_deref().is_some_and(|mw| {
+        matches!(
+            (
+                wfdc::streamid::StreamId::parse(mw),
+                wfdc::streamid::StreamId::parse(&durable),
+            ),
+            (Some(m), Some(d)) if m > d
+        )
+    });
+    if recovered {
+        log::info!(
+            "startup scan: JSONL rows ahead of CHECKPOINT (checkpoint={durable}, highest written={}); resuming from {start}",
+            max_written.as_deref().unwrap_or("")
+        );
+    } else {
+        log::info!("resuming from checkpoint {start}");
+    }
 
     // --- signals: 1st SIGTERM/SIGINT → clean stop, 2nd → immediate exit 1 ---
     let stop = Arc::new(AtomicBool::new(false));
@@ -130,7 +151,7 @@ fn real_main() -> Result<(), Error> {
         &mut redis,
         &cfg.stream,
         &mut store,
-        &checkpoint,
+        &start,
         &opts,
         &stop,
         &mut sleep,

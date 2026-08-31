@@ -86,6 +86,24 @@ fn fsync_dir(dir: &Path) -> Result<(), Error> {
         .map_err(|e| Error::Io(format!("fsync dir {}: {e}", dir.display())))
 }
 
+/// §3.1 resume point: never earlier than the durable CHECKPOINT, but at least
+/// the highest stream id already written to JSONL. A crash between appending
+/// a batch and writing CHECKPOINT leaves rows on disk whose ids the CHECKPOINT
+/// file has not caught up to; resuming from `max(durable, written)` makes the
+/// at-least-once re-read duplicate-free (§3.1: "cannot duplicate rows").
+pub fn resume_start(durable: &str, max_written: Option<&str>) -> String {
+    match max_written {
+        Some(mw) => match (
+            crate::streamid::StreamId::parse(durable),
+            crate::streamid::StreamId::parse(mw),
+        ) {
+            (Some(d), Some(m)) if m > d => mw.to_string(),
+            _ => durable.to_string(),
+        },
+        None => durable.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +186,29 @@ mod tests {
         assert!(!is_valid_stream_id("1725062400000"));
         assert!(!is_valid_stream_id("abc-0"));
         assert!(!is_valid_stream_id("1-2-3"));
+    }
+
+    // --- §3.1 resume point ------------------------------------------------------
+
+    #[test]
+    fn resume_start_prefers_max_written_when_ahead() {
+        assert_eq!(resume_start("0", Some("5-0")), "5-0");
+        assert_eq!(
+            resume_start("1725062400000-2", Some("1725062400000-4")),
+            "1725062400000-4"
+        );
+    }
+
+    #[test]
+    fn resume_start_never_rewinds_below_durable() {
+        assert_eq!(resume_start("5-0", Some("4-0")), "5-0");
+        assert_eq!(resume_start("5-0", Some("5-0")), "5-0");
+        assert_eq!(resume_start("5-0", None), "5-0");
+        assert_eq!(resume_start("0", None), "0");
+        assert_eq!(
+            resume_start("0", Some("not-an-id")),
+            "0",
+            "unparsable written id falls back"
+        );
     }
 }

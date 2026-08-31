@@ -76,6 +76,48 @@ impl Store {
         Ok(out)
     }
 
+    /// §3.1 at-least-once safety net: the highest `stream_id` present in the
+    /// JSONL dataset. A crash between appending a batch and writing
+    /// CHECKPOINT leaves rows on disk whose ids the CHECKPOINT file has not
+    /// caught up to; the caller resumes from `max(durable CHECKPOINT, this)`
+    /// so the re-read after such a crash cannot duplicate rows (§3.1 "cannot
+    /// duplicate rows in raw/ (or anywhere else)"). Lines without a parsable
+    /// `stream_id` (e.g. future `sessions/` rows) are skipped.
+    pub fn max_written_stream_id(&self) -> Result<Option<String>, Error> {
+        let mut best: Option<(crate::streamid::StreamId, String)> = None;
+        let mut stack = vec![self.data_dir.clone()];
+        while let Some(dir) = stack.pop() {
+            let rd = std::fs::read_dir(&dir)
+                .map_err(|e| Error::Io(format!("read_dir {}: {e}", dir.display())))?;
+            for entry in rd {
+                let entry =
+                    entry.map_err(|e| Error::Io(format!("read_dir {}: {e}", dir.display())))?;
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().map(|e| e == "jsonl").unwrap_or(false) {
+                    let text = std::fs::read_to_string(&path)
+                        .map_err(|e| Error::Io(format!("read {}: {e}", path.display())))?;
+                    for line in text.lines() {
+                        let raw = match stream_id_of_line(line) {
+                            Some(id) => id,
+                            None => continue,
+                        };
+                        let parsed = match crate::streamid::StreamId::parse(&raw) {
+                            Some(id) => id,
+                            None => continue,
+                        };
+                        let better = best.as_ref().is_none_or(|(cur, _)| parsed > *cur);
+                        if better {
+                            best = Some((parsed, raw));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(best.map(|(_, raw)| raw))
+    }
+
     /// Append a whole XREAD batch (one flush per batch): group lines by
     /// destination file, write each file once, fsync each file. Returns the
     /// number of files written.
@@ -199,6 +241,12 @@ fn find_last_newline(f: &mut std::fs::File, len: u64) -> Result<u64, Error> {
         pos = start;
     }
     Ok(0)
+}
+
+/// Extract the `stream_id` field from one raw JSONL line, if present.
+fn stream_id_of_line(line: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    v.get("stream_id")?.as_str().map(|s| s.to_string())
 }
 
 #[cfg(test)]
@@ -431,6 +479,50 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("CHECKPOINT")).unwrap(),
             "123-0\n"
+        );
+    }
+
+    // --- §3.1 crash-window watermark scan --------------------------------------
+
+    #[test]
+    fn max_written_returns_highest_stream_id_across_views() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        store
+            .write_batch(&[entry("1-0", "dev-1", "2024-08-31")])
+            .unwrap();
+        store
+            .write_batch(&[entry("2-0", "dev-1", "2024-08-31")])
+            .unwrap();
+        store
+            .write_batch(&[entry("3-0", "dev-2", "2024-09-01")])
+            .unwrap();
+        assert_eq!(
+            store.max_written_stream_id().unwrap().as_deref(),
+            Some("3-0")
+        );
+    }
+
+    #[test]
+    fn max_written_empty_dir_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.max_written_stream_id().unwrap(), None);
+    }
+
+    #[test]
+    fn max_written_ignores_unparsable_lines_and_non_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let f = dir.path().join("raw/dt=2024-08-31/events.jsonl");
+        write_file(
+            &f,
+            "{\"stream_id\":\"1-0\"}\nnot-json\n{\"stream_id\":\"garbage\"}\n{\"stream_id\":\"2-0\"}\n",
+        );
+        write_file(&dir.path().join("CHECKPOINT"), "9-0\n"); // not jsonl → ignored
+        assert_eq!(
+            store.max_written_stream_id().unwrap().as_deref(),
+            Some("2-0")
         );
     }
 }

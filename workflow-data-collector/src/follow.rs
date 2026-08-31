@@ -494,6 +494,50 @@ mod tests {
         assert_eq!(checkpoint::read(dir.path()).unwrap(), "9-0");
     }
 
+    /// The ticket's at-least-once integration scenario, at the unit seam:
+    /// a crash between appending a batch and writing CHECKPOINT leaves rows on
+    /// disk ahead of the durable checkpoint; resuming from
+    /// `max(durable, max written)` must not re-write them.
+    #[test]
+    fn crash_window_resume_skips_rows_already_written() {
+        fn wentry(id: &str) -> crate::raw::WriteEntry {
+            let flat: std::collections::BTreeMap<String, String> = [
+                ("action".to_string(), "task.started".to_string()),
+                ("actor".to_string(), "dev".to_string()),
+                ("team".to_string(), "dev-1".to_string()),
+            ]
+            .into();
+            let d = crate::decode::decode(id, &flat);
+            crate::raw::WriteEntry {
+                team_safe: crate::team::team_safe(d.line.team.as_deref(), d.line.actor.as_deref()),
+                dt: crate::dt::dt_for(id, d.line.ts.as_deref()),
+                line: d.line,
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        // pre-crash state: rows 1-0..4-0 on disk, CHECKPOINT lagging at 2-0
+        // (batch 1 [1-0,2-0] was flushed+checkpointed; batch 2 [3-0,4-0] was
+        // appended and fsynced, then the process died before the checkpoint).
+        store.write_batch(&[wentry("1-0"), wentry("2-0")]).unwrap();
+        checkpoint::write(dir.path(), "2-0").unwrap();
+        store.write_batch(&[wentry("3-0"), wentry("4-0")]).unwrap();
+        // resume point = max(durable CHECKPOINT, highest id written to JSONL)
+        let durable = checkpoint::read(dir.path()).unwrap();
+        let max_written = store.max_written_stream_id().unwrap();
+        let start = crate::checkpoint::resume_start(&durable, max_written.as_deref());
+        assert_eq!(start, "4-0", "resume past the crash-written rows");
+        // the stream re-read returns the crash batch plus one new event
+        let mut src = FakeSource::new();
+        src.push(Ok(vec![entry("3-0"), entry("4-0"), entry("5-0")]));
+        let mut waits = Vec::new();
+        let steps = drive(&mut src, &mut store, &start, &mut waits).unwrap();
+        assert_eq!(steps, vec![Step::Flushed(1)], "only 5-0 is fresh");
+        let lines = lines_in(dir.path());
+        assert_eq!(lines.len(), 5, "1-0..5-0 exactly once — no duplicates");
+        assert_eq!(checkpoint::read(dir.path()).unwrap(), "5-0");
+    }
+
     #[test]
     fn decode_failure_keeps_event_with_decode_ok_false() {
         let dir = tempfile::tempdir().unwrap();
