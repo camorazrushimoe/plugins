@@ -100,7 +100,7 @@ pub fn decode(stream_id: &str, flat: &BTreeMap<String, String>) -> Decoded {
             // known top-level payload keys.
             let payload = match flat.get("payload") {
                 Some(raw) => match serde_json::from_str::<serde_json::Value>(raw) {
-                    Ok(serde_json::Value::Object(_)) => serde_json::from_str(raw).unwrap(),
+                    Ok(v @ serde_json::Value::Object(_)) => v,
                     _ => payload_from_known_keys(flat),
                 },
                 None => payload_from_known_keys(flat),

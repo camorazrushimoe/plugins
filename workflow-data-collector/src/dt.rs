@@ -14,10 +14,8 @@ fn parse_rfc3339(s: &str) -> Option<DateTime<Utc>> {
 
 /// The millisecond component of a Redis stream id (`"<ms>-<seq>"`).
 fn stream_id_ms(stream_id: &str) -> u64 {
-    stream_id
-        .split('-')
-        .next()
-        .and_then(|p| p.parse::<u64>().ok())
+    crate::streamid::StreamId::parse(stream_id)
+        .map(|id| id.ms())
         .unwrap_or(0)
 }
 

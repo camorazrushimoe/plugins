@@ -39,45 +39,72 @@ struct LockEntry {
     started_at: u64,
 }
 
-/// Acquire the single-writer lock, taking over a stale lock. The returned
-/// guard removes the lock file on drop (clean exit).
+/// Acquire the single-writer lock (§3.3).
+///
+/// Acquisition is **atomic** (`create_new`/O_EXCL): two processes racing to
+/// take over a stale lock cannot both win — one `create_new` succeeds, the
+/// other sees `AlreadyExists`, re-reads the winner's entry and exits 3 when
+/// it is live. A stale or corrupt lock is removed and the create retried.
+/// The returned guard removes the lock on drop **only if it still holds our
+/// pid + starttime**, so a loser can never delete the winner's lock.
 pub fn acquire(data_dir: &Path) -> Result<LockGuard, LockError> {
     let path = data_dir.join(LOCK_FILENAME);
-    if path.exists() {
-        match read_entry(&path) {
-            Some(entry) => {
-                if process_is_live(entry.pid, entry.started_at) {
-                    return Err(LockError::Busy);
-                }
-                log::warn!(
-                    "stale lock at {} (pid {} not a live collector) — taking over",
-                    path.display(),
-                    entry.pid
-                );
-            }
-            None => {
-                log::warn!("corrupt lock at {} — taking over", path.display());
-            }
-        }
-    }
     let pid = std::process::id();
     let started_at = get_starttime(pid).unwrap_or(0);
     let entry = LockEntry { pid, started_at };
     let json =
         serde_json::to_vec(&entry).map_err(|e| LockError::Io(format!("serialize lock: {e}")))?;
-    write_private(&path, &json)?;
-    Ok(LockGuard { path })
+
+    const MAX_RETRIES: u32 = 10;
+    for _ in 0..MAX_RETRIES {
+        match create_private(&path) {
+            Ok(mut f) => {
+                use std::io::Write;
+                f.write_all(&json)
+                    .map_err(|e| LockError::Io(format!("write {}: {e}", path.display())))?;
+                f.sync_all()
+                    .map_err(|e| LockError::Io(format!("fsync {}: {e}", path.display())))?;
+                return Ok(LockGuard {
+                    path,
+                    pid,
+                    started_at,
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match read_entry(&path) {
+                Some(existing) if process_is_live(existing.pid, existing.started_at) => {
+                    return Err(LockError::Busy);
+                }
+                _ => {
+                    log::warn!("stale/corrupt lock at {} — taking over", path.display());
+                    std::fs::remove_file(&path)
+                        .map_err(|e| LockError::Io(format!("remove {}: {e}", path.display())))?;
+                }
+            },
+            Err(e) => return Err(LockError::Io(format!("create {}: {e}", path.display()))),
+        }
+    }
+    Err(LockError::Io(format!(
+        "could not acquire lock at {} after {MAX_RETRIES} attempts",
+        path.display()
+    )))
 }
 
-/// Guard that removes the lock file when dropped (clean-stop path).
+/// Guard that removes the lock file on drop **only when it is still ours**
+/// (clean-stop path; a concurrent winner's lock is never touched).
 #[derive(Debug)]
 pub struct LockGuard {
     path: PathBuf,
+    pid: u32,
+    started_at: u64,
 }
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if let Some(entry) = read_entry(&self.path) {
+            if entry.pid == self.pid && entry.started_at == self.started_at {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
     }
 }
 
@@ -86,22 +113,16 @@ fn read_entry(path: &Path) -> Option<LockEntry> {
     serde_json::from_str::<LockEntry>(&text).ok()
 }
 
-fn write_private(path: &Path, bytes: &[u8]) -> Result<(), LockError> {
-    use std::io::Write;
+/// Atomic exclusive create with mode 0600 regardless of umask.
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let mut f = std::fs::OpenOptions::new()
+    let f = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
-        .open(path)
-        .map_err(|e| LockError::Io(format!("create {}: {e}", path.display())))?;
-    f.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| LockError::Io(format!("chmod {}: {e}", path.display())))?;
-    f.write_all(bytes)
-        .map_err(|e| LockError::Io(format!("write {}: {e}", path.display())))?;
-    f.sync_all()
-        .map_err(|e| LockError::Io(format!("fsync {}: {e}", path.display())))
+        .open(path)?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(f)
 }
 
 /// Kernel starttime (clock ticks since boot) of `pid` — field 22 of
@@ -215,6 +236,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(LOCK_FILENAME), "not json at all").unwrap();
         let _g = acquire(dir.path()).expect("corrupt lock → takeover");
+    }
+
+    #[test]
+    fn drop_never_removes_someone_elses_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = acquire(dir.path()).unwrap();
+        // another process wins the lock while we are alive (e.g. after our
+        // pid+starttime record was overwritten by a takeover race)
+        let foreign = LockEntry {
+            pid: std::process::id(),
+            started_at: get_starttime(std::process::id()).unwrap() + 1,
+        };
+        std::fs::write(
+            dir.path().join(LOCK_FILENAME),
+            serde_json::to_vec(&foreign).unwrap(),
+        )
+        .unwrap();
+        drop(guard);
+        assert!(
+            dir.path().join(LOCK_FILENAME).exists(),
+            "a loser's drop must not delete the winner's lock"
+        );
     }
 
     #[test]

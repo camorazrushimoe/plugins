@@ -24,6 +24,10 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<CliArgs, String> {
     let mut it = args.skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
+            // `follow` is the default command; the explicit alias is accepted
+            // here so `wfdc follow` works (§3.4 usage block). Other
+            // subcommands (backfill, status) land with their own tickets.
+            "follow" => {}
             "-h" | "--help" => out.help = true,
             "--config" | "--redis" | "--stream" | "--max-mb" | "--expire-after" => {
                 let value = it.next().ok_or_else(|| format!("{arg} requires a value"))?;
@@ -114,6 +118,27 @@ mod tests {
     fn help_flag() {
         assert!(parse(argv(&["wfdc", "--help"])).unwrap().help);
         assert!(parse(argv(&["wfdc", "-h"])).unwrap().help);
+    }
+
+    #[test]
+    fn explicit_follow_subcommand_is_accepted() {
+        assert_eq!(
+            parse(argv(&["wfdc", "follow"])).unwrap(),
+            CliArgs::default()
+        );
+        assert_eq!(
+            parse(argv(&["wfdc", "follow", "--redis", "redis://x:1"])).unwrap(),
+            CliArgs {
+                redis: Some("redis://x:1".into()),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_subcommand_is_error() {
+        // backfill/status arrive with their own tickets (BON-72/BON-70)
+        assert!(parse(argv(&["wfdc", "backfill"])).is_err());
     }
 
     #[test]

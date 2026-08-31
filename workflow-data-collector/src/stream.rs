@@ -137,8 +137,6 @@ fn redis_string(v: &redis::Value) -> String {
     match v {
         redis::Value::BulkString(b) => String::from_utf8_lossy(b).into_owned(),
         redis::Value::SimpleString(s) => s.clone(),
-        redis::Value::Int(i) => i.to_string(),
-        redis::Value::Okay => "OK".to_string(),
         other => format!("{other:?}"),
     }
 }

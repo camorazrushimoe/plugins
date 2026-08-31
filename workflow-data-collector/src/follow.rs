@@ -66,33 +66,12 @@ impl Backoff {
     }
 }
 
-/// A Redis stream id, compared numerically (`<ms>-<seq>`).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct StreamId {
-    ms: u64,
-    seq: u64,
-}
-
-fn parse_stream_id(id: &str) -> Option<StreamId> {
-    if id == "0" {
-        return Some(StreamId { ms: 0, seq: 0 });
-    }
-    let mut parts = id.split('-');
-    match (parts.next(), parts.next(), parts.next()) {
-        (Some(ms), Some(seq), None) => Some(StreamId {
-            ms: ms.parse().ok()?,
-            seq: seq.parse().ok()?,
-        }),
-        _ => None,
-    }
-}
-
 /// §3.1 dedupe: skip any entry whose stream_id is `<=` the last flushed
 /// checkpoint. Stream ids are monotonic per stream.
 fn should_skip(id: &str, checkpoint: &str) -> Result<bool, Error> {
-    let id = parse_stream_id(id)
+    let id = crate::streamid::StreamId::parse(id)
         .ok_or_else(|| Error::Fatal(format!("unparsable stream id from Redis: {id:?}")))?;
-    let cp = parse_stream_id(checkpoint)
+    let cp = crate::streamid::StreamId::parse(checkpoint)
         .ok_or_else(|| Error::Fatal(format!("unparsable checkpoint: {checkpoint:?}")))?;
     Ok(id <= cp)
 }

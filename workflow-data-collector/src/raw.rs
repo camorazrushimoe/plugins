@@ -97,17 +97,18 @@ impl Store {
     }
 
     fn paths_for(&self, e: &WriteEntry) -> [PathBuf; 2] {
+        let partition = format!("dt={}", e.dt);
         let office = self
             .data_dir
             .join(RAW_DIR)
-            .join(format!("dt={}", e.dt))
+            .join(&partition)
             .join("events.jsonl");
         let team = self
             .data_dir
             .join(TEAMS_DIR)
             .join(&e.team_safe)
             .join(RAW_DIR)
-            .join(format!("dt={}", e.dt))
+            .join(partition)
             .join("events.jsonl");
         [office, team]
     }
@@ -126,18 +127,10 @@ fn ensure_dir_0700(dir: &Path) -> Result<(), Error> {
 /// Append lines to a JSONL file: create parent dirs (0700), open/append with
 /// mode 0600, write all lines, fsync.
 fn append_lines(path: &Path, lines: &[String]) -> Result<(), Error> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     if let Some(parent) = path.parent() {
         ensure_dir_0700(parent)?;
     }
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| Error::Io(format!("open {}: {e}", path.display())))?;
-    f.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| Error::Io(format!("chmod {}: {e}", path.display())))?;
+    let mut f = crate::fsutil::open_private(path, true)?;
     let mut buf = String::new();
     for l in lines {
         buf.push_str(l);

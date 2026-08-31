@@ -5,7 +5,7 @@
 //! checkpoint is only advanced after the batch's JSONL files are written and
 //! fsynced; it never moves backward and never advances for un-flushed data.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::Error;
 
@@ -35,6 +35,11 @@ pub fn read(data_dir: &Path) -> Result<String, Error> {
     Ok(id.to_string())
 }
 
+/// A stream id is `<ms>-<seq>` (both u64) or the special `0`.
+pub fn is_valid_stream_id(id: &str) -> bool {
+    crate::streamid::is_valid(id)
+}
+
 /// Atomically persist the last flushed stream id: write `CHECKPOINT.tmp`,
 /// fsync it, rename over `CHECKPOINT`, fsync the directory.
 pub fn write(data_dir: &Path, id: &str) -> Result<(), Error> {
@@ -48,7 +53,7 @@ pub fn write(data_dir: &Path, id: &str) -> Result<(), Error> {
     let final_path = data_dir.join(CHECKPOINT_FILENAME);
 
     let result = (|| -> Result<(), Error> {
-        let mut f = open_private(&tmp)?;
+        let mut f = crate::fsutil::open_private(&tmp, false)?;
         f.write_all(id.as_bytes())
             .map_err(|e| Error::Io(format!("write {}: {e}", tmp.display())))?;
         f.write_all(b"\n")
@@ -73,44 +78,12 @@ pub fn write(data_dir: &Path, id: &str) -> Result<(), Error> {
     result
 }
 
-/// A stream id is `<ms>-<seq>` (both u64) or the special `0`.
-pub fn is_valid_stream_id(id: &str) -> bool {
-    if id == "0" {
-        return true;
-    }
-    let mut parts = id.split('-');
-    match (parts.next(), parts.next(), parts.next()) {
-        (Some(ms), Some(seq), None) => ms.parse::<u64>().is_ok() && seq.parse::<u64>().is_ok(),
-        _ => false,
-    }
-}
-
-/// Open (create/truncate) a file with mode 0600 regardless of umask.
-fn open_private(path: &Path) -> Result<std::fs::File, Error> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| Error::Io(format!("create {}: {e}", path.display())))?;
-    f.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| Error::Io(format!("chmod {}: {e}", path.display())))?;
-    Ok(f)
-}
-
 /// fsync a directory so a completed rename is durable.
 fn fsync_dir(dir: &Path) -> Result<(), Error> {
     let d = std::fs::File::open(dir)
         .map_err(|e| Error::Io(format!("open dir {}: {e}", dir.display())))?;
     d.sync_all()
         .map_err(|e| Error::Io(format!("fsync dir {}: {e}", dir.display())))
-}
-
-/// Path helper for tests and the store.
-pub fn checkpoint_path(data_dir: &Path) -> PathBuf {
-    data_dir.join(CHECKPOINT_FILENAME)
 }
 
 #[cfg(test)]

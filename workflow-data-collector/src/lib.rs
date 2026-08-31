@@ -12,9 +12,11 @@ pub mod config;
 pub mod decode;
 pub mod dt;
 pub mod follow;
+pub mod fsutil;
 pub mod lock;
 pub mod raw;
 pub mod stream;
+pub mod streamid;
 pub mod team;
 
 use std::fmt;
