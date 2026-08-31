@@ -1,0 +1,23 @@
+[package]
+name = "wfdc"
+version = "0.3.0"
+edition = "2021"
+description = "Workflow Data Collector — reads the factory Redis stream, writes raw JSONL + paired agent sessions (spec v0.3.0)"
+license = "MIT"
+
+[[bin]]
+name = "wfdc"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+redis = "0.27"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+toml = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+sha2 = "0.10"
+
+[profile.release]
+strip = true
+lto = true
