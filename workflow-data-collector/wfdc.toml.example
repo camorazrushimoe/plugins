@@ -1,6 +1,7 @@
 # Copy next to the wfdc binary as `wfdc.toml` and edit the URL.
 
 # Office default host mapping is 6380. A standalone crew may be 6379.
+# Containerized runs (sidecar inside the factory network) use redis://shared-memory:6379.
 redis_url = "redis://127.0.0.1:6380"
 
 # Durable Office / crew event stream. Do not point this at pub/sub.
