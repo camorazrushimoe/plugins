@@ -209,7 +209,11 @@ v1 decoder, in order:
    is the envelope. `payload` comes only from that object's `payload`
    key; step 3 does **not** run. Flat known payload keys are still
    kept, under `fields` — they are never used to rebuild the payload
-   when `json` is authoritative.
+   when `json` is authoritative. Top-level envelope fields missing
+   from the JSON object (`id`, `actor`, `action`, `target`,
+   `timestamp`, `team`, `project`) are overlaid from the flat map;
+   an empty string (`""`) counts as missing for this overlay — the
+   `json` envelope stays authoritative.
 3. Otherwise (no valid `json`/`envelope` object): if `payload` is a
    valid JSON object string, parse it as the payload (flat known keys
    still go to `fields`). If not, treat known payload keys sitting at
