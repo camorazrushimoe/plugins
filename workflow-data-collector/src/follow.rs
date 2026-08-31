@@ -84,6 +84,12 @@ pub struct FollowOptions {
     pub block_ms: u64,
     pub count: usize,
     pub jitter: bool,
+    /// `--max-reads N` / `--once` (§3.4): stop cleanly after N XREAD batches
+    /// (empty batches count — each read iteration is one batch).
+    pub max_reads: Option<usize>,
+    /// `--max-idle-ms MS` (§3.4): stop cleanly when no event arrives for MS,
+    /// checked after each read iteration. 0 = immediate stop.
+    pub max_idle_ms: Option<u64>,
 }
 
 impl Default for FollowOptions {
@@ -92,6 +98,8 @@ impl Default for FollowOptions {
             block_ms: BLOCK_MS,
             count: COUNT,
             jitter: true,
+            max_reads: None,
+            max_idle_ms: None,
         }
     }
 }
@@ -208,12 +216,28 @@ pub fn step<S: StreamSource>(
     }
 }
 
-/// Run the follow loop until `stop` is set. `sleep` is injected so tests can
-/// record waits without sleeping; the production closure parks in short
-/// slices so a signal interrupts promptly. `now` is the wall clock for §5.3
-/// expiry; it is injected so tests can drive time. After **every** read
-/// iteration — including empty rounds — the pairing pool is aged and the
-/// affected `sessions.jsonl` partitions are upserted (§5.3).
+/// Injected time primitives for the follow loop: `sleep` waits during
+/// backoff and `now` reads the clock. `now` is a **wall clock**
+/// (`chrono::DateTime<Utc>`) because it serves two masters — §5.3 expiry
+/// aging (wall-clock elapsed since `started_at`) and the §3.4
+/// `--max-idle-ms` silence timer. Production passes `chrono::Utc::now`;
+/// tests inject a controllable stand-in so expiry and stop-contract
+/// scenarios are deterministic.
+pub struct LoopTime<'a> {
+    pub sleep: &'a mut dyn FnMut(Duration),
+    pub now: &'a mut dyn FnMut() -> chrono::DateTime<chrono::Utc>,
+}
+
+/// Run the follow loop until a stop condition fires. All stop triggers
+/// (§3.4: signal, `--once`, `--max-reads`, `--max-idle-ms`) exit through the
+/// same clean path: the in-flight batch has already been flushed +
+/// CHECKPOINTed inside `step`, and `run` returns `Ok(())` → exit 0.
+///
+/// §5.3 pairing is fully wired in: every decoded event is fed to `pairer`
+/// inside `step`, and after **every** read iteration — including empty rounds
+/// and the final iteration before a stop trigger exits — the pool is aged
+/// and the touched `sessions.jsonl` partitions are upserted. A clean stop
+/// never skips the pairing upsert/expiry (BUG-WFDC-007 seam).
 #[allow(clippy::too_many_arguments)] // the follow loop's collaborators are all distinct seams (§2/§3/§5.3)
 pub fn run<S: StreamSource>(
     source: &mut S,
@@ -222,18 +246,21 @@ pub fn run<S: StreamSource>(
     initial_checkpoint: &str,
     opts: &FollowOptions,
     stop: &AtomicBool,
-    sleep: &mut dyn FnMut(Duration),
+    time: &mut LoopTime,
     pairer: &mut Pairer,
     session_store: &SessionStore,
-    now: &mut dyn FnMut() -> chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Error> {
     let mut checkpoint = initial_checkpoint.to_string();
     let mut backoff = Backoff::new(opts.jitter);
+    let mut reads: usize = 0;
+    let mut last_event = (time.now)();
     loop {
         if stop.load(Ordering::Relaxed) {
             log::info!("stop requested — clean exit at checkpoint {checkpoint}");
             return Ok(());
         }
+        // §3.4: every read iteration (Idle or Flushed) is one XREAD batch and
+        // is checked against the stop conditions; BackingOff is not a read.
         match step(
             source,
             stream,
@@ -243,15 +270,65 @@ pub fn run<S: StreamSource>(
             &mut backoff,
             pairer,
         )? {
-            Step::Idle | Step::Flushed(_) => {}
-            Step::BackingOff(wait) => sleep(wait),
+            Step::Idle => reads += 1,
+            Step::Flushed(_) => {
+                reads += 1;
+                // Events arrived: reset the idle baseline so the timer
+                // measures silence since the last event.
+                last_event = (time.now)();
+            }
+            Step::BackingOff(wait) => {
+                (time.sleep)(wait);
+                continue;
+            }
         }
         // §5.3: expiry aging on every read iteration, incl. empty rounds; the
-        // upsert rewrites each touched day's sessions.jsonl atomically.
-        pairer.age(now());
+        // upsert rewrites each touched day's sessions.jsonl atomically. This
+        // runs on the final iteration too — a stop trigger below can never
+        // skip the pairing upsert/expiry (BUG-WFDC-007 seam).
+        pairer.age((time.now)());
         let writes = pairer.take_writes();
         session_store.upsert(&writes)?;
+        // Common stop-contract tail — identical for every trigger (§3.4:
+        // one clean path → flush+CHECKPOINT already done in `step` → exit 0).
+        if max_reads_reached(opts, reads, &checkpoint) {
+            return Ok(());
+        }
+        if idle_exceeded(opts, (time.now)(), last_event, &checkpoint) {
+            return Ok(());
+        }
     }
+}
+
+/// §3.4 `--once` / `--max-reads N`: stop cleanly after N XREAD batches.
+fn max_reads_reached(opts: &FollowOptions, reads: usize, checkpoint: &str) -> bool {
+    if let Some(n) = opts.max_reads {
+        if reads >= n {
+            log::info!("max-reads reached ({reads}) — clean stop at checkpoint {checkpoint}");
+            return true;
+        }
+    }
+    false
+}
+
+/// §3.4 `--max-idle-ms MS`: stop cleanly when no event arrives for MS
+/// (checked after each read iteration; events reset the timer).
+fn idle_exceeded(
+    opts: &FollowOptions,
+    now: chrono::DateTime<chrono::Utc>,
+    last_event: chrono::DateTime<chrono::Utc>,
+    checkpoint: &str,
+) -> bool {
+    if let Some(ms) = opts.max_idle_ms {
+        let elapsed_ms = now.signed_duration_since(last_event).num_milliseconds() as u64;
+        if elapsed_ms >= ms {
+            log::info!(
+                "no event for {ms} ms (idle {elapsed_ms} ms) — clean stop at checkpoint {checkpoint}"
+            );
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -259,7 +336,7 @@ mod tests {
     use super::*;
     use crate::checkpoint;
     use crate::raw::Store;
-    use crate::stream::{FakeSource, StreamError};
+    use crate::stream::{FakeSource, StreamEntry, StreamError};
 
     fn entry(id: &str) -> crate::stream::StreamEntry {
         FakeSource::entry(
@@ -613,6 +690,10 @@ mod tests {
         let mut pairer = Pairer::new(6);
         let session_store = SessionStore::new(dir.path());
         let mut now = || chrono::Utc::now();
+        let mut time = LoopTime {
+            sleep: &mut sleeper,
+            now: &mut now,
+        };
         run(
             &mut src,
             "office:events",
@@ -623,10 +704,9 @@ mod tests {
                 ..Default::default()
             },
             &stop,
-            &mut sleeper,
+            &mut time,
             &mut pairer,
             &session_store,
-            &mut now,
         )
         .unwrap();
         stopper.join().unwrap();
@@ -644,6 +724,10 @@ mod tests {
         let mut pairer = Pairer::new(6);
         let session_store = SessionStore::new(dir.path());
         let mut now = || chrono::Utc::now();
+        let mut time = LoopTime {
+            sleep: &mut sleeper,
+            now: &mut now,
+        };
         run(
             &mut src,
             "office:events",
@@ -654,10 +738,9 @@ mod tests {
                 ..Default::default()
             },
             &stop,
-            &mut sleeper,
+            &mut time,
             &mut pairer,
             &session_store,
-            &mut now,
         )
         .unwrap();
         assert_eq!(checkpoint::read(dir.path()).unwrap(), "0");
@@ -673,6 +756,10 @@ mod tests {
         let mut pairer = Pairer::new(6);
         let session_store = SessionStore::new(dir.path());
         let mut now = || chrono::Utc::now();
+        let mut time = LoopTime {
+            sleep: &mut sleeper,
+            now: &mut now,
+        };
         run(
             &mut src,
             "office:events",
@@ -683,12 +770,408 @@ mod tests {
                 ..Default::default()
             },
             &stop,
-            &mut sleeper,
+            &mut time,
             &mut pairer,
             &session_store,
-            &mut now,
         )
         .unwrap();
         assert!(lines_in(dir.path()).is_empty());
+    }
+
+    // --- BON-71 §3.4: deterministic stop contract --------------------------
+
+    /// FakeSource wrapper that simulates the XREAD BLOCK timeout on a quiet
+    /// stream: each **empty** read advances the shared clock by `block_ms`
+    /// (a non-empty read returns immediately, so the clock does not move).
+    /// This makes `--max-idle-ms` tests deterministic without real sleeping.
+    struct BlockingClockSource {
+        src: FakeSource,
+        // One injected wall clock (DateTime<Utc>) shared with the follow loop:
+        // each empty read advances it by `block_ms`, so `--max-idle-ms` and
+        // §5.3 expiry scenarios are deterministic without real sleeping.
+        clock: std::sync::Arc<std::sync::Mutex<chrono::DateTime<chrono::Utc>>>,
+        block_ms: u64,
+    }
+
+    impl BlockingClockSource {
+        fn new(
+            block_ms: u64,
+        ) -> (Self, std::sync::Arc<std::sync::Mutex<chrono::DateTime<chrono::Utc>>>) {
+            let clock = std::sync::Arc::new(std::sync::Mutex::new(chrono::Utc::now()));
+            (
+                BlockingClockSource {
+                    src: FakeSource::new(),
+                    clock: std::sync::Arc::clone(&clock),
+                    block_ms,
+                },
+                clock,
+            )
+        }
+    }
+
+    impl StreamSource for BlockingClockSource {
+        fn xread(
+            &mut self,
+            stream: &str,
+            from: &str,
+            block_ms: u64,
+            count: usize,
+        ) -> Result<Vec<StreamEntry>, StreamError> {
+            let out = self.src.xread(stream, from, block_ms, count);
+            if matches!(&out, Ok(v) if v.is_empty()) {
+                *self.clock.lock().unwrap() += chrono::Duration::milliseconds(self.block_ms as i64);
+            }
+            out
+        }
+
+        fn stream_exists(&mut self, stream: &str) -> Result<bool, StreamError> {
+            self.src.stream_exists(stream)
+        }
+    }
+
+    /// Run `follow::run` with a stop contract and a controllable clock. The
+    /// pairer/session store are internal here (no rows are seeded in these
+    /// scenarios); the §5.3 pairing+expiry wiring has its own tests below.
+    fn run_contract(
+        src: &mut impl StreamSource,
+        store: &mut Store,
+        initial_cp: &str,
+        opts: &FollowOptions,
+        clock: &std::sync::Arc<std::sync::Mutex<chrono::DateTime<chrono::Utc>>>,
+    ) -> Result<(), Error> {
+        let stop = AtomicBool::new(false);
+        let mut sleeper = |_: Duration| { /* no backoff in these scripts */ };
+        let mut now = {
+            let clock = std::sync::Arc::clone(clock);
+            move || *clock.lock().unwrap()
+        };
+        let mut time = LoopTime {
+            sleep: &mut sleeper,
+            now: &mut now,
+        };
+        let mut pairer = Pairer::new(6);
+        let session_store = SessionStore::new(store.data_dir());
+        run(
+            src,
+            "office:events",
+            store,
+            initial_cp,
+            opts,
+            &stop,
+            &mut time,
+            &mut pairer,
+            &session_store,
+        )
+    }
+
+    fn opts_with(max_reads: Option<usize>, max_idle_ms: Option<u64>) -> FollowOptions {
+        FollowOptions {
+            jitter: false,
+            max_reads,
+            max_idle_ms,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn once_is_one_batch_then_clean_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let (mut src, _clock) = BlockingClockSource::new(1000);
+        src.src
+            .push(Ok(vec![entry("1-0"), entry("2-0"), entry("3-0")]));
+        // --once ≡ --max-reads 1: exactly one XREAD batch, then exit 0.
+        run_contract(
+            &mut src,
+            &mut store,
+            "0",
+            &opts_with(Some(1), None),
+            &std::sync::Arc::new(std::sync::Mutex::new(chrono::Utc::now())),
+        )
+        .unwrap();
+        let lines = lines_in(dir.path());
+        assert_eq!(lines.len(), 3, "one batch flushed");
+        assert_eq!(checkpoint::read(dir.path()).unwrap(), "3-0");
+    }
+
+    #[test]
+    fn once_on_empty_stream_is_one_empty_batch_and_no_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let (mut src, clock) = BlockingClockSource::new(1000);
+        // --once on an empty stream: one (empty) batch, exit 0, no CHECKPOINT.
+        run_contract(&mut src, &mut store, "0", &opts_with(Some(1), None), &clock).unwrap();
+        assert!(lines_in(dir.path()).is_empty());
+        assert!(
+            !dir.path().join("CHECKPOINT").exists(),
+            "no flush → no CHECKPOINT file"
+        );
+    }
+
+    #[test]
+    fn max_reads_counts_empty_rounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let (mut src, _clock) = BlockingClockSource::new(1000);
+        // MAX-1(a): 1 event pending, --max-reads 2 → round 1 flushes E1,
+        // round 2 blocks ~1s and returns empty → exit 0, CHECKPOINT = E1.
+        src.src.push(Ok(vec![entry("1-0")]));
+        run_contract(
+            &mut src,
+            &mut store,
+            "0",
+            &opts_with(Some(2), None),
+            &std::sync::Arc::new(std::sync::Mutex::new(chrono::Utc::now())),
+        )
+        .unwrap();
+        assert_eq!(lines_in(dir.path()).len(), 1);
+        assert_eq!(checkpoint::read(dir.path()).unwrap(), "1-0");
+    }
+
+    #[test]
+    fn max_reads_three_empty_rounds_stops_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let (mut src, _clock) = BlockingClockSource::new(1000);
+        // MAX-1(b): --max-reads 3 on an empty stream → 3 empty rounds, exit 0.
+        run_contract(
+            &mut src,
+            &mut store,
+            "0",
+            &opts_with(Some(3), None),
+            &std::sync::Arc::new(std::sync::Mutex::new(chrono::Utc::now())),
+        )
+        .unwrap();
+        assert!(lines_in(dir.path()).is_empty());
+        assert!(!dir.path().join("CHECKPOINT").exists());
+    }
+
+    #[test]
+    fn max_reads_does_not_count_backoff_rounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let (mut src, _clock) = BlockingClockSource::new(1000);
+        // Redis down once (BackingOff — NOT a batch), then one real batch.
+        src.src.push(Err(StreamError::Unavailable("down".into())));
+        src.src.push(Ok(vec![entry("1-0")]));
+        let mut waits = Vec::new();
+        let stop = AtomicBool::new(false);
+        let mut sleeper = |d: Duration| waits.push(d.as_millis() as u64);
+        let mut now = || chrono::Utc::now();
+        let mut time = LoopTime {
+            sleep: &mut sleeper,
+            now: &mut now,
+        };
+        let mut pairer = Pairer::new(6);
+        let session_store = SessionStore::new(dir.path());
+        run(
+            &mut src,
+            "office:events",
+            &mut store,
+            "0",
+            &opts_with(Some(1), None),
+            &stop,
+            &mut time,
+            &mut pairer,
+            &session_store,
+        )
+        .unwrap();
+        assert_eq!(waits, vec![1000], "backoff ran once");
+        assert_eq!(
+            lines_in(dir.path()).len(),
+            1,
+            "the batch was the 1 counted read"
+        );
+        assert_eq!(checkpoint::read(dir.path()).unwrap(), "1-0");
+    }
+
+    #[test]
+    fn max_idle_stops_after_idle_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let (mut src, clock) = BlockingClockSource::new(1000);
+        // IDL-1: empty stream, --max-idle-ms 2000 → 2 empty rounds (each
+        // simulating a 1000ms BLOCK) then clean stop; no busy-loop.
+        let base = *clock.lock().unwrap();
+        run_contract(
+            &mut src,
+            &mut store,
+            "0",
+            &opts_with(None, Some(2000)),
+            &clock,
+        )
+        .unwrap();
+        assert!(lines_in(dir.path()).is_empty());
+        assert!(!dir.path().join("CHECKPOINT").exists());
+        // The clock advanced exactly two block windows → ~2000ms elapsed.
+        let elapsed = clock.lock().unwrap().signed_duration_since(base).num_milliseconds();
+        assert!((1900..=2100).contains(&elapsed), "elapsed {elapsed}ms");
+    }
+
+    #[test]
+    fn max_idle_events_reset_the_timer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let (mut src, clock) = BlockingClockSource::new(1000);
+        // IDL-3: events keep the run alive past the window; the timer resets
+        // on every flush. Script: event at t=0 (flush), then two empty rounds
+        // (t=1000, t=2000). max_idle=1500 → stop after the round at t=2000.
+        let base = *clock.lock().unwrap();
+        src.src.push(Ok(vec![entry("1-0")]));
+        run_contract(
+            &mut src,
+            &mut store,
+            "0",
+            &opts_with(None, Some(1500)),
+            &clock,
+        )
+        .unwrap();
+        assert_eq!(lines_in(dir.path()).len(), 1, "the event was flushed");
+        assert_eq!(checkpoint::read(dir.path()).unwrap(), "1-0");
+        let elapsed = clock.lock().unwrap().signed_duration_since(base).num_milliseconds();
+        assert!(
+            (1900..=2100).contains(&elapsed),
+            "stopped ~2s after start: {elapsed}ms"
+        );
+    }
+
+    #[test]
+    fn max_idle_zero_is_immediate_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let (mut src, clock) = BlockingClockSource::new(1000);
+        // IDL-4 pin: --max-idle-ms 0 = zero idle tolerance → stop after the
+        // first read iteration (a flush), before any further XREAD.
+        src.src.push(Ok(vec![entry("1-0")]));
+        let base = *clock.lock().unwrap();
+        run_contract(&mut src, &mut store, "0", &opts_with(None, Some(0)), &clock).unwrap();
+        assert_eq!(lines_in(dir.path()).len(), 1);
+        assert_eq!(checkpoint::read(dir.path()).unwrap(), "1-0");
+        let elapsed = clock.lock().unwrap().signed_duration_since(base).num_milliseconds();
+        assert!(elapsed < 1900, "no extra idle rounds: elapsed {elapsed}ms");
+    }
+
+    #[test]
+    fn max_reads_and_max_idle_both_apply_first_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let (mut src, clock) = BlockingClockSource::new(1000);
+        // max_reads=1 wins before the 3000ms idle window elapses.
+        src.src.push(Ok(vec![entry("1-0")]));
+        let base = *clock.lock().unwrap();
+        run_contract(
+            &mut src,
+            &mut store,
+            "0",
+            &opts_with(Some(1), Some(3000)),
+            &clock,
+        )
+        .unwrap();
+        assert_eq!(checkpoint::read(dir.path()).unwrap(), "1-0");
+        let elapsed = clock.lock().unwrap().signed_duration_since(base).num_milliseconds();
+        assert!(elapsed < 1900, "max_reads stopped first: {elapsed}ms");
+    }
+
+    // --- BUG-WFDC-007 seam regression: the §3.4 clean-stop path must not ----
+    // --- skip the §5.3 pairing upsert / expiry aging.                    ----
+
+    /// The stop path must not skip the pairing upsert: `--max-reads 1`
+    /// (≡ `--once`) flushes a `task.started`; the open session row must be
+    /// written to `sessions.jsonl` before the clean stop exits.
+    #[test]
+    fn max_reads_stop_path_flushes_pairing_upsert() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let session_store = SessionStore::new(dir.path());
+        let (mut src, _clock) = BlockingClockSource::new(1000);
+        src.src.push(Ok(vec![entry("1-0")])); // task.started for (dev-1, dev)
+        run_contract(
+            &mut src,
+            &mut store,
+            "0",
+            &opts_with(Some(1), None),
+            &std::sync::Arc::new(std::sync::Mutex::new(chrono::Utc::now())),
+        )
+        .unwrap();
+        let rows = session_store.load_all().unwrap();
+        assert_eq!(rows.len(), 1, "the open start row was upserted before the clean stop");
+        assert_eq!(rows[0].state, crate::sessions::State::Open);
+        assert_eq!(rows[0].start_stream_id.as_deref(), Some("1-0"));
+    }
+
+    /// Expiry must run on a quiet stream even when `--max-idle-ms` triggers
+    /// the clean stop: the stop happens after a read iteration, and the §5.3
+    /// aging + upsert run on that iteration (the BUG-WFDC-007 seam gap named
+    /// in QA: "expiry not running on a quiet stream with --max-idle-ms").
+    #[test]
+    fn idle_stop_still_ages_expiry_on_quiet_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_store = SessionStore::new(dir.path());
+        // Seed an `open` start whose started_at is 2h in the past — with a
+        // 1h expiry window it must be aged to `expired` during the run.
+        let started_at = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        let open_row = crate::sessions::SessionRow {
+            session_pk: "pk-seed-open".into(),
+            team: "dev-1".into(),
+            actor: "dev".into(),
+            session_id: None,
+            start_stream_id: Some("1-0".into()),
+            finish_stream_id: None,
+            started_at: Some(started_at.clone()),
+            finished_at: None,
+            duration_ms: None,
+            state: crate::sessions::State::Open,
+            snippet_in: None,
+            snippet_out: None,
+            issues: None,
+            prs: None,
+            linear: None,
+            handoff: None,
+            project: None,
+        };
+        let loc = open_row.location();
+        session_store
+            .upsert(&[crate::sessions::SessionWrite {
+                team_folder: loc.0.clone(),
+                dt: loc.1.clone(),
+                rows: vec![open_row.clone()],
+            }])
+            .unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let (mut src, clock) = BlockingClockSource::new(1000);
+        // Quiet stream: only empty rounds. --max-idle-ms 0 stops after the
+        // first read iteration — the aging/upsert on that iteration must
+        // still land (expiry runs before the clean stop exits).
+        let stop = AtomicBool::new(false);
+        let mut sleeper = |_: Duration| { /* no backoff in this script */ };
+        let mut now = {
+            let clock = std::sync::Arc::clone(&clock);
+            move || *clock.lock().unwrap()
+        };
+        let mut time = LoopTime {
+            sleep: &mut sleeper,
+            now: &mut now,
+        };
+        let mut pairer = Pairer::new(1); // 1h expiry window
+        pairer.rebuild(session_store.load_all().unwrap());
+        run(
+            &mut src,
+            "office:events",
+            &mut store,
+            "0",
+            &opts_with(None, Some(0)),
+            &stop,
+            &mut time,
+            &mut pairer,
+            &session_store,
+        )
+        .unwrap();
+        let rows = session_store.load_all().unwrap();
+        assert_eq!(rows.len(), 1, "the seeded open row is still on disk");
+        assert_eq!(
+            rows[0].state,
+            crate::sessions::State::Expired,
+            "expiry aging ran on the quiet idle round before the clean stop"
+        );
     }
 }

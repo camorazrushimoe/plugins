@@ -15,6 +15,14 @@ pub struct CliArgs {
     pub stream: Option<String>,
     pub max_mb: Option<i64>,
     pub expire_after: Option<i64>,
+    /// `--once`: one XREAD batch then clean stop (§3.4) — equivalent to
+    /// `--max-reads 1`. Mutually exclusive with `--max-reads`.
+    pub once: bool,
+    /// `--max-reads N`: N XREAD batches then clean stop (§3.4). `N >= 1`.
+    pub max_reads: Option<i64>,
+    /// `--max-idle-ms MS`: clean stop when no event arrives for MS (§3.4).
+    /// `MS >= 0` (0 = immediate stop after the first read iteration).
+    pub max_idle_ms: Option<i64>,
     pub help: bool,
     pub command: Command,
 }
@@ -78,7 +86,9 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<CliArgs, String> {
                 out.command = Command::Backfill { from, to };
             }
             "-h" | "--help" => out.help = true,
-            "--config" | "--redis" | "--stream" | "--max-mb" | "--expire-after" => {
+            "--once" => out.once = true,
+            "--config" | "--redis" | "--stream" | "--max-mb" | "--expire-after" | "--max-reads"
+            | "--max-idle-ms" => {
                 let value = it.next().ok_or_else(|| format!("{arg} requires a value"))?;
                 match arg.as_str() {
                     "--config" => out.config = Some(PathBuf::from(value)),
@@ -96,13 +106,46 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<CliArgs, String> {
                         })?;
                         out.expire_after = Some(n);
                     }
+                    "--max-reads" => {
+                        let n: i64 = value.parse().map_err(|_| {
+                            format!("--max-reads expects an integer, got {value:?}")
+                        })?;
+                        if n < 1 {
+                            return Err(format!("--max-reads expects N >= 1, got {n}"));
+                        }
+                        out.max_reads = Some(n);
+                    }
+                    "--max-idle-ms" => {
+                        let n: i64 = value.parse().map_err(|_| {
+                            format!("--max-idle-ms expects an integer, got {value:?}")
+                        })?;
+                        if n < 0 {
+                            return Err(format!("--max-idle-ms expects MS >= 0, got {n}"));
+                        }
+                        out.max_idle_ms = Some(n);
+                    }
                     _ => unreachable!(),
                 }
             }
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
+    if out.once && out.max_reads.is_some() {
+        return Err("--once cannot be combined with --max-reads (--once ≡ --max-reads 1)".into());
+    }
     Ok(out)
+}
+
+impl CliArgs {
+    /// §3.4 `--once` ≡ `--max-reads 1`: the effective batch count for the
+    /// follow loop, or `None` when neither flag is passed (follow forever).
+    pub fn follow_max_reads(&self) -> Option<usize> {
+        if self.once {
+            Some(1)
+        } else {
+            self.max_reads.map(|n| n as usize)
+        }
+    }
 }
 
 pub const USAGE: &str = "\
@@ -119,6 +162,9 @@ OPTIONS:
     --stream <NAME>       Stream name (else $WFDC_STREAM, config file, office:events)
     --max-mb <N>          JSONL cap in MB (0→500, 1–15→16; else $WFDC_MAX_MB, file, 500)
     --expire-after <H>    Session expiry window in hours (default 6; test knob)
+    --once                Read one XREAD batch, flush, CHECKPOINT, exit 0 (§3.4; ≡ --max-reads 1)
+    --max-reads <N>       N XREAD batches (empty batches count), then clean stop (§3.4); N >= 1
+    --max-idle-ms <MS>    Clean stop when no event arrives for MS (§3.4); MS >= 0 (0 = immediate)
     -h, --help            Print this help
 
 The default command is follow: blocking XREAD on the stream, writing the raw
@@ -129,6 +175,9 @@ with the same writer, decoder and pairing rules as follow (§3.5): dedupe
 applies (an entry at/below the resume point — max of the durable CHECKPOINT
 and the highest id already written to JSONL — is skipped), CHECKPOINT moves
 forward only, and an inverted/empty range writes nothing and exits 0.
+
+All stop triggers share one clean-stop path: flush → CHECKPOINT → exit 0
+(the max_mb cap step lands with the disk-cap feature, §5.5).
 ";
 
 #[cfg(test)]
@@ -273,5 +322,84 @@ mod tests {
     fn negative_max_mb_accepted_for_normalization() {
         let c = parse(argv(&["wfdc", "--max-mb", "-5"])).unwrap();
         assert_eq!(c.max_mb, Some(-5));
+    }
+
+    #[test]
+    fn once_flag_parses() {
+        let c = parse(argv(&["wfdc", "--once"])).unwrap();
+        assert!(c.once);
+        assert_eq!(c.max_reads, None);
+    }
+
+    #[test]
+    fn max_reads_parses() {
+        let c = parse(argv(&["wfdc", "--max-reads", "10"])).unwrap();
+        assert!(!c.once);
+        assert_eq!(c.max_reads, Some(10));
+    }
+
+    #[test]
+    fn max_idle_ms_parses() {
+        let c = parse(argv(&["wfdc", "--max-idle-ms", "5000"])).unwrap();
+        assert_eq!(c.max_idle_ms, Some(5000));
+    }
+
+    #[test]
+    fn all_stop_flags_parse_together() {
+        let c = parse(argv(&["wfdc", "--max-reads", "3", "--max-idle-ms", "1500"])).unwrap();
+        assert_eq!(c.max_reads, Some(3));
+        assert_eq!(c.max_idle_ms, Some(1500));
+    }
+
+    #[test]
+    fn once_combined_with_max_reads_is_error() {
+        assert!(parse(argv(&["wfdc", "--once", "--max-reads", "2"])).is_err());
+    }
+
+    #[test]
+    fn max_reads_zero_or_negative_is_error() {
+        assert!(parse(argv(&["wfdc", "--max-reads", "0"])).is_err());
+        assert!(parse(argv(&["wfdc", "--max-reads", "-1"])).is_err());
+        assert!(parse(argv(&["wfdc", "--max-reads", "abc"])).is_err());
+    }
+
+    #[test]
+    fn max_idle_negative_is_error_zero_is_ok() {
+        assert!(parse(argv(&["wfdc", "--max-idle-ms", "-1"])).is_err());
+        assert!(parse(argv(&["wfdc", "--max-idle-ms", "abc"])).is_err());
+        // 0 is allowed: "0 idle tolerance" → immediate clean stop (IDL-4 pin)
+        assert_eq!(
+            parse(argv(&["wfdc", "--max-idle-ms", "0"]))
+                .unwrap()
+                .max_idle_ms,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn follow_max_reads_none_without_flags() {
+        assert_eq!(CliArgs::default().follow_max_reads(), None);
+        assert_eq!(
+            parse(argv(&["wfdc", "--max-idle-ms", "500"]))
+                .unwrap()
+                .follow_max_reads(),
+            None
+        );
+    }
+
+    #[test]
+    fn follow_max_reads_once_equals_one() {
+        assert_eq!(
+            parse(argv(&["wfdc", "--once"]))
+                .unwrap()
+                .follow_max_reads(),
+            Some(1)
+        );
+        assert_eq!(
+            parse(argv(&["wfdc", "--max-reads", "10"]))
+                .unwrap()
+                .follow_max_reads(),
+            Some(10)
+        );
     }
 }
