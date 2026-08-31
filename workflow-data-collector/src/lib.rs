@@ -3,24 +3,34 @@
 //! Follows the factory Redis stream (`office:events`) in near-real-time and
 //! writes a raw, minimally structured JSONL dataset to `data_dir`, without
 //! duplicates or data loss. This crate implements §2 (config + perms),
-//! §3.1–3.3 (flush/checkpoint/dedupe, startup repair, single-writer lock) and
-//! §9.1–9.2 (core pipeline) of `SPEC.md`.
+//! §3.1–3.3 (flush/checkpoint/dedupe, startup repair, single-writer lock),
+//! §3.5 (backfill), §5.3 (session pairing) and §5.5 (max_mb enforcement) of
+//! `SPEC.md`.
 
 pub mod backfill;
 pub mod checkpoint;
 pub mod cli;
 pub mod config;
 pub mod decode;
+pub mod drop_log;
 pub mod dt;
 pub mod follow;
 pub mod fsutil;
+pub mod layout;
 pub mod lock;
+pub mod max_mb;
 pub mod pairing;
 pub mod raw;
 pub mod sessions;
 pub mod stream;
 pub mod streamid;
 pub mod team;
+pub mod trim;
+
+pub use drop_log::{DropLog, DropLogEntry, Scope, DROP_LOG_CAP};
+pub use layout::{DataDir, EventLine, RawView, SessionRow, SessionsView, ViewKind};
+pub use max_mb::{pin_max_mb, resolve_max_mb, DEFAULT_MAX_MB, FLOOR_MAX_MB};
+pub use trim::{enforce_bytes_cap, enforce_cap, TrimReport, MB};
 
 use std::fmt;
 
