@@ -329,6 +329,7 @@ mod tests {
         let c = parse(argv(&["wfdc", "--once"])).unwrap();
         assert!(c.once);
         assert_eq!(c.max_reads, None);
+        assert_eq!(c.follow_max_reads(), Some(1), "--once ≡ --max-reads 1");
     }
 
     #[test]
@@ -336,6 +337,18 @@ mod tests {
         let c = parse(argv(&["wfdc", "--max-reads", "10"])).unwrap();
         assert!(!c.once);
         assert_eq!(c.max_reads, Some(10));
+        assert_eq!(c.follow_max_reads(), Some(10));
+    }
+
+    #[test]
+    fn follow_max_reads_none_without_flags() {
+        assert_eq!(CliArgs::default().follow_max_reads(), None);
+        assert_eq!(
+            parse(argv(&["wfdc", "--max-idle-ms", "500"]))
+                .unwrap()
+                .follow_max_reads(),
+            None
+        );
     }
 
     #[test]
@@ -373,17 +386,6 @@ mod tests {
                 .unwrap()
                 .max_idle_ms,
             Some(0)
-        );
-    }
-
-    #[test]
-    fn follow_max_reads_none_without_flags() {
-        assert_eq!(CliArgs::default().follow_max_reads(), None);
-        assert_eq!(
-            parse(argv(&["wfdc", "--max-idle-ms", "500"]))
-                .unwrap()
-                .follow_max_reads(),
-            None
         );
     }
 
