@@ -145,6 +145,13 @@ impl Pairer {
         self.expiry_hours
     }
 
+    /// Total session rows known to this engine (the on-disk pool rebuilt at
+    /// startup plus anything opened/closed since). Deterministic; used by
+    /// backfill for its outcome summary.
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
     /// Rebuild in-memory state from the rows already on disk (startup /
     /// backfill). `open` and `interrupted` rows re-enter the unmatched pool so
     /// a finish still pairs with a start flushed by an earlier run (§5.3 —

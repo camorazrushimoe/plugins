@@ -177,6 +177,46 @@ wfdc status          # checkpoint, last flush, redis reachable, bytes used / cap
 wfdc status --json   # same, machine-readable (§5.4)
 ```
 
+### 3.5 backfill
+
+`wfdc backfill [--from STREAM_ID] [--to STREAM_ID]` replays a **chosen
+range** of the stream (first install, rebuilt derived tables, or a trimmed
+stream you recovered elsewhere) — automatic catch-up is the checkpoint's
+job. It writes raw + session rows with the **same writer, decoder and
+pairing rules as follow** (§4.1, §5.1, §5.3).
+
+- **Range.** `[--from, --to]` is inclusive on both ends (Redis XRANGE
+  semantics). Defaults: `--from 0` (stream start), `--to +` (stream end).
+  An inverted range (`--from` after `--to`) or a range with no entries
+  writes nothing and exits 0.
+- **Dedupe (§3.1) applies.** An entry whose `stream_id` is `<=` the
+  **resume point** is skipped, exactly like follow. The resume point is
+  `max(durable CHECKPOINT, highest stream id already written to JSONL)`
+  — the same startup scan follow performs — so a re-run after a crash
+  between appending a batch and writing CHECKPOINT cannot duplicate the
+  rows that are already on disk. Re-running a range never duplicates
+  rows, and a range that sits entirely at/below the resume point writes
+  nothing.
+- **Pairing pool is rebuilt from disk.** Before the range is processed,
+  the unmatched-start pool (§5.3) is reconstructed from the session rows
+  already on disk, so a finish inside the range still pairs with a start
+  that was flushed earlier (`<=` resume point) — the same cross-batch
+  pool persistence follow has in memory. Skipped entries are never fed
+  to the pool a second time.
+- **CHECKPOINT is never moved backward.** It advances forward to
+  `max(current, last backfilled stream id)` only after everything is on
+  disk (§3.1 ordering), so follow-mode checkpoint semantics are
+  undisturbed and follow will not re-read the backfilled range. A run
+  that wrote nothing leaves CHECKPOINT untouched.
+- **Expiry.** Follow evaluates wall-clock expiry (§5.3) on every read
+  iteration; backfill has no read iterations, so it evaluates expiry once
+  against wall clock at the end of the range — reproducing the session
+  state follow would have produced for the same events.
+- **Lock and exit codes.** Backfill is a writer: it takes the `.lock`
+  (§3.3) and exits **3** when a live collector holds it. Exit **0** on
+  success (including empty/inverted ranges), **1** on fatal config/IO
+  errors or an invalid `--from`/`--to` (§3.4).
+
 ---
 
 ## 4. What is read

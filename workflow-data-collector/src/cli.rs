@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 /// Parsed command line. `None` means "not passed" — env/file fill the gap.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CliArgs {
     pub config: Option<PathBuf>,
     pub redis: Option<String>,
@@ -16,6 +16,34 @@ pub struct CliArgs {
     pub max_mb: Option<i64>,
     pub expire_after: Option<i64>,
     pub help: bool,
+    pub command: Command,
+}
+
+impl Default for CliArgs {
+    fn default() -> Self {
+        CliArgs {
+            config: None,
+            redis: None,
+            stream: None,
+            max_mb: None,
+            expire_after: None,
+            help: false,
+            command: Command::Follow,
+        }
+    }
+}
+
+/// The invoked subcommand. `follow` is the default; `backfill` replays a
+/// chosen stream range (§3.5, §9 item 7).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Command {
+    Follow,
+    Backfill {
+        /// First stream id of the range, inclusive (default `0` = stream start).
+        from: String,
+        /// Last stream id of the range, inclusive (default `+` = stream end).
+        to: String,
+    },
 }
 
 /// Parse argv (including the program name at index 0, which is skipped).
@@ -25,9 +53,30 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<CliArgs, String> {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             // `follow` is the default command; the explicit alias is accepted
-            // here so `wfdc follow` works (§3.4 usage block). Other
-            // subcommands (backfill, status) land with their own tickets.
-            "follow" => {}
+            // here so `wfdc follow` works (§3.4 usage block).
+            "follow" => out.command = Command::Follow,
+            // `backfill` consumes the rest of the line: --from/--to (defaults
+            // 0 and +). Global flags must precede the subcommand (§3.5).
+            "backfill" => {
+                let mut from = "0".to_string();
+                let mut to = "+".to_string();
+                while let Some(flag) = it.next() {
+                    match flag.as_str() {
+                        "--from" => {
+                            from = it
+                                .next()
+                                .ok_or_else(|| "--from requires a value".to_string())?
+                        }
+                        "--to" => {
+                            to = it
+                                .next()
+                                .ok_or_else(|| "--to requires a value".to_string())?
+                        }
+                        other => return Err(format!("unknown argument {other:?}")),
+                    }
+                }
+                out.command = Command::Backfill { from, to };
+            }
             "-h" | "--help" => out.help = true,
             "--config" | "--redis" | "--stream" | "--max-mb" | "--expire-after" => {
                 let value = it.next().ok_or_else(|| format!("{arg} requires a value"))?;
@@ -61,6 +110,8 @@ wfdc — Workflow Data Collector (spec v0.3.0)
 
 USAGE:
     wfdc [OPTIONS]
+    wfdc [OPTIONS] follow
+    wfdc [OPTIONS] backfill [--from STREAM_ID] [--to STREAM_ID]
 
 OPTIONS:
     --config <PATH>       Config file (else $WFDC_CONFIG, <binary-dir>/wfdc.toml, ./wfdc.toml)
@@ -72,6 +123,12 @@ OPTIONS:
 
 The default command is follow: blocking XREAD on the stream, writing the raw
 dataset to data_dir. SIGTERM/SIGINT flush and exit 0; a second signal exits 1.
+
+backfill replays a chosen inclusive range [--from, --to] (defaults 0 and +)
+with the same writer, decoder and pairing rules as follow (§3.5): dedupe
+applies (an entry at/below the resume point — max of the durable CHECKPOINT
+and the highest id already written to JSONL — is skipped), CHECKPOINT moves
+forward only, and an inverted/empty range writes nothing and exits 0.
 ";
 
 #[cfg(test)]
@@ -137,8 +194,63 @@ mod tests {
 
     #[test]
     fn unknown_subcommand_is_error() {
-        // backfill/status arrive with their own tickets (BON-72/BON-70)
-        assert!(parse(argv(&["wfdc", "backfill"])).is_err());
+        // status arrives with its own ticket (BON-70)
+        assert!(parse(argv(&["wfdc", "status"])).is_err());
+    }
+
+    #[test]
+    fn backfill_defaults_to_full_range() {
+        let c = parse(argv(&["wfdc", "backfill"])).unwrap();
+        assert_eq!(
+            c.command,
+            Command::Backfill {
+                from: "0".into(),
+                to: "+".into()
+            }
+        );
+    }
+
+    #[test]
+    fn backfill_parses_from_and_to() {
+        let c = parse(argv(&[
+            "wfdc",
+            "backfill",
+            "--from",
+            "1725062400000-0",
+            "--to",
+            "1725062400099-0",
+        ]))
+        .unwrap();
+        assert_eq!(
+            c.command,
+            Command::Backfill {
+                from: "1725062400000-0".into(),
+                to: "1725062400099-0".into()
+            }
+        );
+    }
+
+    #[test]
+    fn backfill_accepts_only_from() {
+        let c = parse(argv(&["wfdc", "backfill", "--from", "5-0"])).unwrap();
+        assert_eq!(
+            c.command,
+            Command::Backfill {
+                from: "5-0".into(),
+                to: "+".into()
+            }
+        );
+    }
+
+    #[test]
+    fn backfill_missing_value_is_error() {
+        assert!(parse(argv(&["wfdc", "backfill", "--from"])).is_err());
+        assert!(parse(argv(&["wfdc", "backfill", "--to"])).is_err());
+    }
+
+    #[test]
+    fn backfill_unknown_flag_is_error() {
+        assert!(parse(argv(&["wfdc", "backfill", "--nope"])).is_err());
     }
 
     #[test]

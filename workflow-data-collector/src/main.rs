@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use wfdc::backfill;
 use wfdc::cli;
 use wfdc::config::{Config, Sources};
 use wfdc::follow::{self, FollowOptions};
@@ -65,7 +66,7 @@ fn real_main() -> Result<(), Error> {
     );
 
     // --- store, perms (§2: data_dir 0700, files 0600), single-writer lock ----
-    let mut store = Store::open(&cfg.data_dir)?;
+    let store = Store::open(&cfg.data_dir)?;
     let _lock = lock::acquire(&cfg.data_dir).map_err(|e| match e {
         LockError::Busy => Error::LockBusy,
         LockError::Io(m) => Error::Io(m),
@@ -107,6 +108,15 @@ fn real_main() -> Result<(), Error> {
         log::info!("resuming from checkpoint {start}");
     }
 
+    match cli.command {
+        cli::Command::Follow => run_follow(cfg, store, &start),
+        cli::Command::Backfill { from, to } => run_backfill(cfg, store, &start, &from, &to),
+    }
+}
+
+/// Follow: install signal handlers, then block on the follow loop until a
+/// clean stop (1st SIGTERM/SIGINT → flush + exit 0; 2nd → exit 1).
+fn run_follow(cfg: Config, store: Store, start: &str) -> Result<(), Error> {
     // --- signals: 1st SIGTERM/SIGINT → clean stop, 2nd → immediate exit 1 ---
     let stop = Arc::new(AtomicBool::new(false));
     let signal_stop = Arc::clone(&stop);
@@ -134,6 +144,7 @@ fn real_main() -> Result<(), Error> {
         }
     });
 
+    let mut store = store;
     // --- follow ----------------------------------------------------------------
     let mut redis = RedisStream::new(&cfg.redis_url)?;
     let opts = FollowOptions::default();
@@ -160,7 +171,7 @@ fn real_main() -> Result<(), Error> {
         &mut redis,
         &cfg.stream,
         &mut store,
-        &start,
+        start,
         &opts,
         &stop,
         &mut sleep,
@@ -170,5 +181,27 @@ fn real_main() -> Result<(), Error> {
     )?;
 
     log::info!("clean stop (checkpoint durable)");
+    Ok(())
+}
+
+/// Backfill: one-shot chosen-range replay with the same writer/decoder/pairing
+/// rules as follow (§3.5). Dedupe and the resume point were already computed
+/// above (max of the durable CHECKPOINT and the highest id written to JSONL).
+fn run_backfill(cfg: Config, store: Store, start: &str, from: &str, to: &str) -> Result<(), Error> {
+    let mut store = store;
+    let mut redis = RedisStream::new(&cfg.redis_url)?;
+    let session_store = SessionStore::new(&cfg.data_dir);
+    let mut now = chrono::Utc::now;
+    backfill::run(
+        &mut redis,
+        &cfg.stream,
+        &mut store,
+        &session_store,
+        start,
+        cfg.expire_hours,
+        from,
+        to,
+        &mut now,
+    )?;
     Ok(())
 }
