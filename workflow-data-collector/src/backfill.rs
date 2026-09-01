@@ -172,11 +172,11 @@ pub fn run<S: StreamSource>(
     // at/below the resume point) is a byte-true no-op (§3.5 "writes
     // nothing"): expiry of pre-existing rows is follow's job, not a no-op
     // backfill's.
-    let flushed = !write_entries.is_empty();
+    let has_entries = !write_entries.is_empty();
 
     // §5.3 expiry: evaluated once at the end of the range (wall clock) so a
     // backfill of old data reproduces what follow would have produced.
-    if flushed {
+    if has_entries {
         pairer.age(now());
 
         // Everything is staged in memory — flush once (raw batch, then
@@ -196,7 +196,7 @@ pub fn run<S: StreamSource>(
 
     // §5.5: after every successful flush, enforce the cap. A no-op backfill
     // wrote nothing, so there is nothing to enforce.
-    if flushed {
+    if has_entries {
         crate::cap::enforce(store.data_dir(), max_mb, now().into());
     }
 
