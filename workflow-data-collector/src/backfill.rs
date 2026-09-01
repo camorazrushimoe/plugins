@@ -1,4 +1,4 @@
-//! `wfdc backfill [--from STREAM_ID] [--to STREAM_ID]` (§3.5, §9.7).
+//! `wfdc backfill [--from STREAM_ID] [--to STREAM_ID]` (§3.5, §9 item 7).
 //!
 //! Replays a **chosen range** of the stream (first install, rebuilt derived
 //! tables, a trimmed stream recovered elsewhere) — automatic catch-up is the
@@ -518,6 +518,79 @@ mod tests {
         assert_eq!(rows[0].state, State::Completed);
         assert_eq!(rows[0].start_stream_id.as_deref(), Some("1000-0"));
         assert_eq!(rows[0].finish_stream_id.as_deref(), Some("1001-0"));
+    }
+
+    // --- §5.3 expiry: evaluated once against wall clock at end of range ------
+
+    #[test]
+    fn expiry_is_evaluated_once_at_end_of_range() {
+        // §3.5: backfill has no read iterations, so it ages the pairing pool
+        // once against wall clock at the end of the range. An `open` row
+        // whose started_at is past the window must land on disk as `expired`
+        // — exactly the session state follow would have produced.
+        let dir = tempfile::tempdir().unwrap();
+        let mut src = FakeSource::new();
+        // started_at = 2026-08-30T10:00:00Z; frozen clock = 2026-08-30T21:00:00Z
+        // → 11 h elapsed; window = 1 h → strictly longer → expired.
+        src.push(Ok(vec![start_sid("1000-0")]));
+        let session_store = SessionStore::new(dir.path());
+        let mut store = Store::open(dir.path()).unwrap();
+        let mut now = || frozen_clock();
+        let out = run(
+            &mut src,
+            "office:events",
+            &mut store,
+            &session_store,
+            "0",      // resume
+            1,        // expire_hours: 1 h window
+            "0",      // from
+            "1000-0", // to
+            &mut now,
+        )
+        .unwrap();
+        assert_eq!(out.raw_lines, 1);
+        use crate::sessions::State;
+        let rows = session_store.load_all().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].state,
+            State::Expired,
+            "open row past the window expires at end of range"
+        );
+        assert_eq!(rows[0].start_stream_id.as_deref(), Some("1000-0"));
+    }
+
+    #[test]
+    fn expiry_boundary_exactly_at_window_keeps_row_open() {
+        // §5.3: strictly longer than the window is required to expire;
+        // exactly at the window the row stays open and leaves the pool.
+        let dir = tempfile::tempdir().unwrap();
+        let mut src = FakeSource::new();
+        src.push(Ok(vec![start_sid("1000-0")]));
+        let session_store = SessionStore::new(dir.path());
+        let mut store = Store::open(dir.path()).unwrap();
+        let mut now = || frozen_clock();
+        let out = run(
+            &mut src,
+            "office:events",
+            &mut store,
+            &session_store,
+            "0",
+            11, // window == elapsed (11 h) → not strictly longer
+            "0",
+            "1000-0",
+            &mut now,
+        )
+        .unwrap();
+        assert_eq!(out.raw_lines, 1);
+        use crate::sessions::State;
+        let rows = session_store.load_all().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].state,
+            State::Open,
+            "exactly at the window is not expired"
+        );
     }
 
     // --- BUG-WFDC-004: deterministic key order + byte-exact JSON --------------

@@ -948,3 +948,46 @@ fn backfill_respects_the_single_writer_lock() {
     assert_eq!(mode & 0o777, 0o600);
     let _ = std::fs::remove_dir_all(&dir2);
 }
+
+// ---------------------------------------------------------------------------
+// §5.3 expiry: backfill ages the pairing pool once against wall clock at the
+// end of the range. A start with a far-past timestamp and a 1 h window must
+// land on disk as `expired` (deterministic for any clock after 2020-01-01).
+// ---------------------------------------------------------------------------
+#[test]
+fn backfill_expires_open_rows_past_window_at_end_of_range() {
+    let mut tr = TestRedis::new();
+    tr.xadd(
+        "1725000000000-0",
+        &[
+            ("action", "task.started"),
+            ("actor", "dev"),
+            ("team", "dev-1"),
+            ("session_id", "s-exp"),
+            ("timestamp", "2020-01-01T00:00:00Z"),
+        ],
+    );
+    let dir = temp_data_dir("expiry");
+    let cfg = Config {
+        redis_url: redis_url(),
+        stream: tr.stream.clone(),
+        data_dir: dir.clone(),
+        max_mb: 0,
+        expire_hours: 1,
+    };
+    let out = run_backfill(&cfg, "0", "+").expect("backfill ok");
+    assert_eq!(out.raw_lines, 1);
+    let rows = read_session_rows(&dir);
+    assert_eq!(
+        rows.len(),
+        1,
+        "one session row — the open start expired at end of range"
+    );
+    assert_eq!(rows[0].state, State::Expired);
+    assert_eq!(rows[0].start_stream_id.as_deref(), Some("1725000000000-0"));
+    assert_eq!(
+        rows[0].finish_stream_id, None,
+        "expired is terminal: no finish was ever seen"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -34,7 +34,7 @@ impl Default for CliArgs {
 }
 
 /// The invoked subcommand. `follow` is the default; `backfill` replays a
-/// chosen stream range (§3.5, §9.7).
+/// chosen stream range (§3.5, §9 item 7).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Follow,
