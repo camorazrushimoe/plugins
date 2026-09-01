@@ -38,6 +38,19 @@ fn dt_of_ms(ms: u64) -> String {
         .unwrap_or_else(|| "1970-01-01".to_string())
 }
 
+/// Full UTC instant for an event (§4.2): the envelope `timestamp` when it
+/// parses as RFC 3339, else the Redis stream-id millisecond clock, else the
+/// Unix epoch. The pairing engine (§5.3) uses this for `started_at` /
+/// `finished_at` / `duration_ms`; it applies exactly the same fallback rule
+/// as [`dt_for`], so a session row's `dt=` partition always agrees with the
+/// raw line's.
+pub fn resolve(stream_id: &str, ts: Option<&str>) -> DateTime<Utc> {
+    ts.and_then(parse_rfc3339).unwrap_or_else(|| {
+        DateTime::<Utc>::from_timestamp_millis(stream_id_ms(stream_id) as i64)
+            .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,5 +91,54 @@ mod tests {
     fn garbage_stream_id_falls_back_to_epoch() {
         assert_eq!(dt_for("garbage", None), "1970-01-01");
         assert_eq!(dt_for("", None), "1970-01-01");
+    }
+
+    #[test]
+    fn resolve_prefers_rfc3339() {
+        let dt = resolve("9999999999999-0", Some("2026-08-30T21:00:00Z"));
+        assert_eq!(
+            dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "2026-08-30T21:00:00Z"
+        );
+    }
+
+    #[test]
+    fn resolve_offset_timestamp_converts_to_utc() {
+        let dt = resolve("1-0", Some("2026-08-31T00:30:00+02:00"));
+        assert_eq!(
+            dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "2026-08-30T22:30:00Z"
+        );
+    }
+
+    #[test]
+    fn resolve_falls_back_to_stream_id_clock() {
+        let dt = resolve("1725062400000-42", Some("not-a-date"));
+        assert_eq!(dt.timestamp_millis(), 1725062400000);
+        let dt2 = resolve("1725062400000-42", None);
+        assert_eq!(dt2.timestamp_millis(), 1725062400000);
+    }
+
+    #[test]
+    fn resolve_garbage_falls_back_to_epoch() {
+        let dt = resolve("garbage", None);
+        assert_eq!(dt, DateTime::<Utc>::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn resolve_and_dt_for_agree() {
+        // Same rule → the session row's dt= matches the raw line's dt=.
+        assert_eq!(
+            dt_for("1725062400000-0", Some("not-a-date")),
+            resolve("1725062400000-0", Some("not-a-date"))
+                .format("%Y-%m-%d")
+                .to_string()
+        );
+        assert_eq!(
+            dt_for("1725062400000-0", Some("2026-08-30T21:00:00Z")),
+            resolve("1725062400000-0", Some("2026-08-30T21:00:00Z"))
+                .format("%Y-%m-%d")
+                .to_string()
+        );
     }
 }

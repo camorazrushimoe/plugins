@@ -15,7 +15,9 @@ use wfdc::cli;
 use wfdc::config::{Config, Sources};
 use wfdc::follow::{self, FollowOptions};
 use wfdc::lock::{self, LockError};
+use wfdc::pairing::Pairer;
 use wfdc::raw::Store;
+use wfdc::sessions::SessionStore;
 use wfdc::stream::RedisStream;
 use wfdc::Error;
 
@@ -135,6 +137,12 @@ fn real_main() -> Result<(), Error> {
     // --- follow ----------------------------------------------------------------
     let mut redis = RedisStream::new(&cfg.redis_url)?;
     let opts = FollowOptions::default();
+    // §5.3: the pairing pool is rebuilt from the session rows already on disk,
+    // so an `open` / `interrupted` start from a previous run is still pairable
+    // by a finish arriving after this restart (cross-batch pool persistence).
+    let session_store = SessionStore::new(&cfg.data_dir);
+    let mut pairer = Pairer::new(cfg.expire_hours);
+    pairer.rebuild(session_store.load_all()?);
     let mut sleep = |dur: Duration| {
         // park in slices so the signal handler can unpark us promptly; never
         // sleep past a graceful-stop request.
@@ -147,6 +155,7 @@ fn real_main() -> Result<(), Error> {
             std::thread::park_timeout(deadline - now);
         }
     };
+    let mut now = chrono::Utc::now;
     follow::run(
         &mut redis,
         &cfg.stream,
@@ -155,6 +164,9 @@ fn real_main() -> Result<(), Error> {
         &opts,
         &stop,
         &mut sleep,
+        &mut pairer,
+        &session_store,
+        &mut now,
     )?;
 
     log::info!("clean stop (checkpoint durable)");
