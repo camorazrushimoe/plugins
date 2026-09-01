@@ -830,6 +830,17 @@ mod tests {
         fn stream_exists(&mut self, stream: &str) -> Result<bool, StreamError> {
             self.src.stream_exists(stream)
         }
+
+        fn xrange(
+            &mut self,
+            stream: &str,
+            from: &str,
+            to: &str,
+            count: usize,
+        ) -> Result<Vec<StreamEntry>, StreamError> {
+            // xrange is backfill-only; the stop-contract tests never call it.
+            self.src.xrange(stream, from, to, count)
+        }
     }
 
     /// Run `follow::run` with a stop contract and a controllable clock. The

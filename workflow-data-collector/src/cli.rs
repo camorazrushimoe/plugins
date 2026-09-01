@@ -35,6 +35,9 @@ impl Default for CliArgs {
             stream: None,
             max_mb: None,
             expire_after: None,
+            once: false,
+            max_reads: None,
+            max_idle_ms: None,
             help: false,
             command: Command::Follow,
         }

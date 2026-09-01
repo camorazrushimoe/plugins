@@ -109,14 +109,26 @@ fn real_main() -> Result<(), Error> {
     }
 
     match cli.command {
-        cli::Command::Follow => run_follow(cfg, store, &start),
+        cli::Command::Follow => run_follow(
+            cfg,
+            store,
+            &start,
+            cli.follow_max_reads(),
+            cli.max_idle_ms.map(|n| n as u64),
+        ),
         cli::Command::Backfill { from, to } => run_backfill(cfg, store, &start, &from, &to),
     }
 }
 
 /// Follow: install signal handlers, then block on the follow loop until a
 /// clean stop (1st SIGTERM/SIGINT → flush + exit 0; 2nd → exit 1).
-fn run_follow(cfg: Config, store: Store, start: &str) -> Result<(), Error> {
+fn run_follow(
+    cfg: Config,
+    store: Store,
+    start: &str,
+    max_reads: Option<usize>,
+    max_idle_ms: Option<u64>,
+) -> Result<(), Error> {
     // --- signals: 1st SIGTERM/SIGINT → clean stop, 2nd → immediate exit 1 ---
     let stop = Arc::new(AtomicBool::new(false));
     let signal_stop = Arc::clone(&stop);
@@ -153,13 +165,12 @@ fn run_follow(cfg: Config, store: Store, start: &str) -> Result<(), Error> {
     // trigger because `follow::run` exits through one code path; `--max-mb`
     // enforcement itself lands with BON-69 (§5.5).
     let opts = FollowOptions {
-        max_reads: cli.follow_max_reads(),
-        max_idle_ms: cli.max_idle_ms.map(|n| n as u64),
+        max_reads,
+        max_idle_ms,
         ..Default::default()
     };
     log::info!(
-        "stop contract: once={} max_reads={:?} max_idle_ms={:?}",
-        cli.once,
+        "stop contract: max_reads={:?} max_idle_ms={:?}",
         opts.max_reads,
         opts.max_idle_ms
     );
