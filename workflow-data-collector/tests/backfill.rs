@@ -991,3 +991,26 @@ fn backfill_expires_open_rows_past_window_at_end_of_range() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// §3.5 exit codes: an invalid --from/--to is a config error → exit 1,
+// end-to-end through the real binary (unit tests cover validate_bound).
+// ---------------------------------------------------------------------------
+#[test]
+fn backfill_invalid_bound_exits_1() {
+    let dir = temp_data_dir("invalid");
+    let bin = env!("CARGO_BIN_EXE_wfdc");
+    let out = Command::new(bin)
+        .env("WFDC_DATA_DIR", &dir)
+        .args(["--redis", &redis_url(), "--stream", "wfdc-invalid-bound"])
+        .args(["backfill", "--from", "garbage", "--to", "+"])
+        .output()
+        .expect("run backfill with invalid bound");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

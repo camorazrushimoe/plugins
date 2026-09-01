@@ -63,7 +63,7 @@ pub struct BackfillOutcome {
 }
 
 /// Validate a `--from`/`--to` stream id: `0`, `-`, `+` or `<ms>-<seq>`.
-pub fn validate_bound(s: &str, what: &str) -> Result<(), Error> {
+fn validate_bound(s: &str, what: &str) -> Result<(), Error> {
     if s == "+" || s == "-" || s == "0" {
         return Ok(());
     }
@@ -166,13 +166,19 @@ pub fn run<S: StreamSource>(
     }
 
     // §5.3 expiry: evaluated once at the end of the range (wall clock) so a
-    // backfill of old data reproduces what follow would have produced.
-    pairer.age(now());
+    // backfill of old data reproduces what follow would have produced. A run
+    // with nothing in range (empty/inverted range, or everything at/below the
+    // resume point) is a byte-true no-op (§3.5 "writes nothing"): expiry of
+    // pre-existing rows is follow's job, not a no-op backfill's.
+    if !write_entries.is_empty() {
+        pairer.age(now());
 
-    // Everything is staged in memory — flush once (raw batch, then session
-    // partitions), then move the checkpoint forward-only (§3.1 ordering).
-    store.write_batch(&write_entries)?;
-    session_store.upsert(&pairer.take_writes())?;
+        // Everything is staged in memory — flush once (raw batch, then
+        // session partitions), then move the checkpoint forward-only (§3.1
+        // ordering).
+        store.write_batch(&write_entries)?;
+        session_store.upsert(&pairer.take_writes())?;
+    }
 
     // Nothing flushed → never touch the checkpoint (§3.5: untouched when
     // nothing is written). Otherwise any written id is > resume >= durable,
@@ -590,6 +596,63 @@ mod tests {
             rows[0].state,
             State::Open,
             "exactly at the window is not expired"
+        );
+    }
+
+    #[test]
+    fn fully_skipped_range_leaves_session_view_untouched() {
+        // §3.5: "a range that sits entirely at/below the resume point writes
+        // nothing" — byte-true for the session view too. A no-op run must not
+        // run the once-at-end expiry and rewrite on-disk rows (open → expired);
+        // that is follow's job, not a no-op backfill's.
+        let dir = tempfile::tempdir().unwrap();
+        // Run 1: an open start. Elapsed = exactly 11 h, window = 11 h → not
+        // strictly longer → stays Open on disk.
+        let mut src = FakeSource::new();
+        src.push(Ok(vec![start_sid("1000-0")]));
+        let session_store = SessionStore::new(dir.path());
+        let mut store = Store::open(dir.path()).unwrap();
+        let mut now = || frozen_clock();
+        run(
+            &mut src,
+            "office:events",
+            &mut store,
+            &session_store,
+            "0",
+            11, // window == elapsed → Open
+            "0",
+            "1000-0",
+            &mut now,
+        )
+        .unwrap();
+
+        // Run 2: the same range, now entirely at/below the resume point. With
+        // a 1 h window the row is far past expiry — but nothing is written,
+        // so it must stay Open.
+        let mut src2 = FakeSource::new();
+        src2.push(Ok(vec![start_sid("1000-0")]));
+        let mut store2 = Store::open(dir.path()).unwrap();
+        let mut now2 = || frozen_clock();
+        let out = run(
+            &mut src2,
+            "office:events",
+            &mut store2,
+            &session_store,
+            "1000-0",
+            1,
+            "0",
+            "1000-0",
+            &mut now2,
+        )
+        .unwrap();
+        assert_eq!(out.raw_lines, 0, "everything at/below resume is skipped");
+        use crate::sessions::State;
+        let rows = session_store.load_all().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].state,
+            State::Open,
+            "no-op run must not expire pre-existing rows"
         );
     }
 
