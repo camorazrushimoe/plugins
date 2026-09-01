@@ -159,6 +159,7 @@ impl Harness {
                 jitter: false,
                 ..Default::default()
             },
+            100_000, // max_mb: no cap in these tests
             &self.stop,
             &mut time,
             &mut pairer,
@@ -195,6 +196,7 @@ impl Harness {
                 jitter: false,
                 ..Default::default()
             },
+            100_000, // max_mb: no cap in these tests
             &self.stop,
             &mut time,
             &mut pairer,

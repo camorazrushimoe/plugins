@@ -98,7 +98,9 @@ fn after(id: &str) -> String {
 /// max_written)` — computed by the caller (main, or the test harness) so the
 /// caller owns the startup scan (§3.1 crash-window recovery) exactly as the
 /// follow path does. `now` is the wall clock for §5.3 expiry, injected for
-/// tests.
+/// tests. `max_mb` is the §5.5 disk cap (already normalized, spec §2); it is
+/// enforced after the run's single flush, exactly like follow enforces after
+/// every flush.
 #[allow(clippy::too_many_arguments)] // the backfill run's collaborators are distinct seams (§2/§3/§5.3)
 pub fn run<S: StreamSource>(
     source: &mut S,
@@ -107,6 +109,7 @@ pub fn run<S: StreamSource>(
     session_store: &SessionStore,
     resume: &str,
     expire_hours: u64,
+    max_mb: u64,
     from: &str,
     to: &str,
     now: &mut dyn FnMut() -> DateTime<Utc>,
@@ -165,12 +168,15 @@ pub fn run<S: StreamSource>(
         cursor = after(page.last().expect("non-empty page").id.as_str());
     }
 
+    // A run with nothing in range (empty/inverted range, or everything
+    // at/below the resume point) is a byte-true no-op (§3.5 "writes
+    // nothing"): expiry of pre-existing rows is follow's job, not a no-op
+    // backfill's.
+    let flushed = !write_entries.is_empty();
+
     // §5.3 expiry: evaluated once at the end of the range (wall clock) so a
-    // backfill of old data reproduces what follow would have produced. A run
-    // with nothing in range (empty/inverted range, or everything at/below the
-    // resume point) is a byte-true no-op (§3.5 "writes nothing"): expiry of
-    // pre-existing rows is follow's job, not a no-op backfill's.
-    if !write_entries.is_empty() {
+    // backfill of old data reproduces what follow would have produced.
+    if flushed {
         pairer.age(now());
 
         // Everything is staged in memory — flush once (raw batch, then
@@ -186,6 +192,12 @@ pub fn run<S: StreamSource>(
     let new_cp = last_written.clone();
     if let Some(cp) = &new_cp {
         crate::checkpoint::write(store.data_dir(), cp)?;
+    }
+
+    // §5.5: after every successful flush, enforce the cap. A no-op backfill
+    // wrote nothing, so there is nothing to enforce.
+    if flushed {
+        crate::cap::enforce(store.data_dir(), max_mb, now().into());
     }
 
     let checkpoint = new_cp
@@ -277,6 +289,7 @@ mod tests {
             &session_store,
             resume,
             100_000, // effectively no expiry for determinism tests
+            100_000, // max_mb: no cap in these tests
             from,
             to,
             &mut now,
@@ -507,6 +520,7 @@ mod tests {
             &session_store,
             "1000-0",
             100_000,
+            100_000, // max_mb: no cap in these tests
             "0",
             "1001-0",
             &mut now,
@@ -549,6 +563,7 @@ mod tests {
             &session_store,
             "0",      // resume
             1,        // expire_hours: 1 h window
+            100_000,  // max_mb: no cap in these tests
             "0",      // from
             "1000-0", // to
             &mut now,
@@ -582,7 +597,8 @@ mod tests {
             &mut store,
             &session_store,
             "0",
-            11, // window == elapsed (11 h) → not strictly longer
+            11,      // window == elapsed (11 h) → not strictly longer
+            100_000, // max_mb: no cap in these tests
             "0",
             "1000-0",
             &mut now,
@@ -619,7 +635,8 @@ mod tests {
             &mut store,
             &session_store,
             "0",
-            11, // window == elapsed → Open
+            11,      // window == elapsed → Open
+            100_000, // max_mb: no cap in these tests
             "0",
             "1000-0",
             &mut now,
@@ -640,6 +657,7 @@ mod tests {
             &session_store,
             "1000-0",
             1,
+            100_000, // max_mb: no cap in these tests
             "0",
             "1000-0",
             &mut now2,
@@ -690,6 +708,88 @@ mod tests {
             raw_lines(d1.path()),
             raw_lines(d2.path()),
             "byte-identical raw rows"
+        );
+    }
+
+    // --- §5.5 wiring: backfill enforces the cap after its flush ------------
+
+    /// Drive `run` with a fresh store and an explicit cap; returns the outcome.
+    fn run_with_mb(
+        src: &mut FakeSource,
+        dir: &Path,
+        resume: &str,
+        from: &str,
+        to: &str,
+        max_mb: u64,
+    ) -> Result<BackfillOutcome, Error> {
+        let mut store = Store::open(dir).unwrap();
+        let session_store = SessionStore::new(dir);
+        let mut now = || frozen_clock();
+        run(
+            src,
+            "office:events",
+            &mut store,
+            &session_store,
+            resume,
+            100_000, // effectively no expiry for determinism tests
+            max_mb,
+            from,
+            to,
+            &mut now,
+        )
+    }
+
+    /// Write `raw/dt=<date>/events.jsonl` with at least `target_bytes` of
+    /// stream-id'd lines (the collector's raw shape) — a fixture big enough
+    /// to push a `max_mb=1` (1 MiB) cap over its limit.
+    fn seed_big_date(dir: &Path, date: &str, target_bytes: usize) {
+        let p = dir.join(format!("raw/dt={date}/events.jsonl"));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let line = "{\"stream_id\":\"1725062400000-0\",\"action\":\"task.started\",\"ts\":\"2026-08-30T00:00:00Z\",\"team\":\"dev-1\"}\n";
+        let mut content = String::with_capacity(target_bytes + 64);
+        while content.len() < target_bytes {
+            content.push_str(line);
+        }
+        std::fs::write(&p, content).unwrap();
+    }
+
+    /// A `task.started` entry with an explicit RFC 3339 timestamp, so the
+    /// decoded line lands in the `dt=` partition of that date.
+    fn entry_ts(id: &str, ts: &str) -> StreamEntry {
+        FakeSource::entry(
+            id,
+            &[
+                ("action", "task.started"),
+                ("actor", "dev"),
+                ("team", "dev-1"),
+                ("timestamp", ts),
+            ],
+        )
+    }
+
+    /// §5.5: backfill writes with the same flush path as follow, so the cap
+    /// is enforced after its single flush. The fixture is *under* the cap at
+    /// startup; the backfilled batch pushes it over → the oldest date is
+    /// deleted.
+    #[test]
+    fn run_enforces_cap_after_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_big_date(dir.path(), "2026-08-30", 400_000);
+        seed_big_date(dir.path(), "2026-08-31", 400_000);
+        let mut src = FakeSource::new();
+        let page: Vec<StreamEntry> = (0..1500u64)
+            .map(|i| entry_ts(&format!("1725062400000-{i}"), "2026-08-31T10:00:00Z"))
+            .collect();
+        src.push(Ok(page));
+        let out = run_with_mb(&mut src, dir.path(), "0", "0", "+", 1).unwrap();
+        assert_eq!(out.raw_lines, 1500);
+        assert!(
+            !dir.path().join("raw/dt=2026-08-30/events.jsonl").exists(),
+            "post-flush enforcement deleted the oldest date"
+        );
+        assert!(
+            raw_stream_ids(dir.path()).contains(&"1725062400000-1499".to_string()),
+            "the backfilled batch survives in the newer date"
         );
     }
 }

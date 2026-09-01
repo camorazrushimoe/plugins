@@ -8,6 +8,7 @@
 //! `SPEC.md`.
 
 pub mod backfill;
+pub mod cap;
 pub mod checkpoint;
 pub mod cli;
 pub mod config;

@@ -104,7 +104,7 @@ fn cfg_for(dir: &Path, stream: &str) -> Config {
         redis_url: redis_url(),
         stream: stream.to_string(),
         data_dir: dir.to_path_buf(),
-        max_mb: 0,
+        max_mb: 100_000, // effectively no cap for determinism tests (§5.5 wiring is tested explicitly)
         expire_hours: 100000, // effectively no expiry for determinism tests
     }
 }
@@ -132,6 +132,7 @@ fn run_backfill(
         &session_store,
         &resume,
         cfg.expire_hours,
+        cfg.max_mb,
         from,
         to,
         &mut now,
@@ -972,7 +973,7 @@ fn backfill_expires_open_rows_past_window_at_end_of_range() {
         redis_url: redis_url(),
         stream: tr.stream.clone(),
         data_dir: dir.clone(),
-        max_mb: 0,
+        max_mb: 100_000, // no cap — this test is about expiry, not the trim
         expire_hours: 1,
     };
     let out = run_backfill(&cfg, "0", "+").expect("backfill ok");
