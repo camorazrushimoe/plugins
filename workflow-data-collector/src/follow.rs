@@ -796,7 +796,10 @@ mod tests {
     impl BlockingClockSource {
         fn new(
             block_ms: u64,
-        ) -> (Self, std::sync::Arc<std::sync::Mutex<chrono::DateTime<chrono::Utc>>>) {
+        ) -> (
+            Self,
+            std::sync::Arc<std::sync::Mutex<chrono::DateTime<chrono::Utc>>>,
+        ) {
             let clock = std::sync::Arc::new(std::sync::Mutex::new(chrono::Utc::now()));
             (
                 BlockingClockSource {
@@ -1004,7 +1007,11 @@ mod tests {
         assert!(lines_in(dir.path()).is_empty());
         assert!(!dir.path().join("CHECKPOINT").exists());
         // The clock advanced exactly two block windows → ~2000ms elapsed.
-        let elapsed = clock.lock().unwrap().signed_duration_since(base).num_milliseconds();
+        let elapsed = clock
+            .lock()
+            .unwrap()
+            .signed_duration_since(base)
+            .num_milliseconds();
         assert!((1900..=2100).contains(&elapsed), "elapsed {elapsed}ms");
     }
 
@@ -1028,7 +1035,11 @@ mod tests {
         .unwrap();
         assert_eq!(lines_in(dir.path()).len(), 1, "the event was flushed");
         assert_eq!(checkpoint::read(dir.path()).unwrap(), "1-0");
-        let elapsed = clock.lock().unwrap().signed_duration_since(base).num_milliseconds();
+        let elapsed = clock
+            .lock()
+            .unwrap()
+            .signed_duration_since(base)
+            .num_milliseconds();
         assert!(
             (1900..=2100).contains(&elapsed),
             "stopped ~2s after start: {elapsed}ms"
@@ -1047,7 +1058,11 @@ mod tests {
         run_contract(&mut src, &mut store, "0", &opts_with(None, Some(0)), &clock).unwrap();
         assert_eq!(lines_in(dir.path()).len(), 1);
         assert_eq!(checkpoint::read(dir.path()).unwrap(), "1-0");
-        let elapsed = clock.lock().unwrap().signed_duration_since(base).num_milliseconds();
+        let elapsed = clock
+            .lock()
+            .unwrap()
+            .signed_duration_since(base)
+            .num_milliseconds();
         assert!(elapsed < 1900, "no extra idle rounds: elapsed {elapsed}ms");
     }
 
@@ -1068,7 +1083,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(checkpoint::read(dir.path()).unwrap(), "1-0");
-        let elapsed = clock.lock().unwrap().signed_duration_since(base).num_milliseconds();
+        let elapsed = clock
+            .lock()
+            .unwrap()
+            .signed_duration_since(base)
+            .num_milliseconds();
         assert!(elapsed < 1900, "max_reads stopped first: {elapsed}ms");
     }
 
@@ -1084,7 +1103,19 @@ mod tests {
         let mut store = Store::open(dir.path()).unwrap();
         let session_store = SessionStore::new(dir.path());
         let (mut src, _clock) = BlockingClockSource::new(1000);
-        src.src.push(Ok(vec![entry("1-0")])); // task.started for (dev-1, dev)
+        // A task.started with a fresh RFC 3339 timestamp: the 6h expiry
+        // window must NOT age this row mid-run — the assertion is on the
+        // pairing upsert landing before the clean stop.
+        let ts = chrono::Utc::now().to_rfc3339();
+        src.src.push(Ok(vec![FakeSource::entry(
+            "1-0",
+            &[
+                ("action", "task.started"),
+                ("actor", "dev"),
+                ("team", "dev-1"),
+                ("timestamp", ts.as_str()),
+            ],
+        )]));
         run_contract(
             &mut src,
             &mut store,
@@ -1094,7 +1125,11 @@ mod tests {
         )
         .unwrap();
         let rows = session_store.load_all().unwrap();
-        assert_eq!(rows.len(), 1, "the open start row was upserted before the clean stop");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the open start row was upserted before the clean stop"
+        );
         assert_eq!(rows[0].state, crate::sessions::State::Open);
         assert_eq!(rows[0].start_stream_id.as_deref(), Some("1-0"));
     }

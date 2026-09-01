@@ -392,9 +392,7 @@ mod tests {
     #[test]
     fn follow_max_reads_once_equals_one() {
         assert_eq!(
-            parse(argv(&["wfdc", "--once"]))
-                .unwrap()
-                .follow_max_reads(),
+            parse(argv(&["wfdc", "--once"])).unwrap().follow_max_reads(),
             Some(1)
         );
         assert_eq!(
