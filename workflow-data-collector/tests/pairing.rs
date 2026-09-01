@@ -96,6 +96,17 @@ impl StreamSource for Scripted {
         Ok(vec![])
     }
 
+    fn xrange(
+        &mut self,
+        _stream: &str,
+        _from: &str,
+        _to: &str,
+        _count: usize,
+    ) -> Result<Vec<StreamEntry>, StreamError> {
+        // xrange is backfill-only; the follow-loop tests never call it.
+        unreachable!("xrange is not used by the follow loop")
+    }
+
     fn stream_exists(&mut self, _stream: &str) -> Result<bool, StreamError> {
         Ok(true)
     }

@@ -42,6 +42,17 @@ pub trait StreamSource {
         count: usize,
     ) -> Result<Vec<StreamEntry>, StreamError>;
 
+    /// Read one XRANGE page: entries with id in `[from, to]` (inclusive,
+    /// Redis XRANGE semantics), up to `count`. Used by `backfill` for a
+    /// chosen-range replay; `follow` never calls it.
+    fn xrange(
+        &mut self,
+        stream: &str,
+        from: &str,
+        to: &str,
+        count: usize,
+    ) -> Result<Vec<StreamEntry>, StreamError>;
+
     /// Whether the stream key exists (§3: a missing key is logged and
     /// retried with backoff, like Redis being down — never a silent idle).
     fn stream_exists(&mut self, stream: &str) -> Result<bool, StreamError>;
@@ -113,6 +124,41 @@ impl StreamSource for RedisStream {
             }
         }
         Ok(out)
+    }
+
+    fn xrange(
+        &mut self,
+        stream: &str,
+        from: &str,
+        to: &str,
+        count: usize,
+    ) -> Result<Vec<StreamEntry>, StreamError> {
+        let result = self.ensure_conn().and_then(|conn| {
+            conn.xrange_count(stream, from, to, count)
+                .map_err(|e| StreamError::Unavailable(format!("xrange: {e}")))
+        });
+        let reply: redis::streams::StreamRangeReply = match result {
+            Ok(r) => r,
+            Err(e) => {
+                // drop the broken connection; the next call reconnects
+                self.conn = None;
+                return Err(e);
+            }
+        };
+        // The redis crate hands back each entry's field map as a HashMap;
+        // collect into a BTreeMap so serialized output is deterministic.
+        Ok(reply
+            .ids
+            .iter()
+            .map(|sid| StreamEntry {
+                id: sid.id.clone(),
+                fields: sid
+                    .map
+                    .iter()
+                    .map(|(k, v)| (k.clone(), redis_string(v)))
+                    .collect(),
+            })
+            .collect())
     }
 
     fn stream_exists(&mut self, stream: &str) -> Result<bool, StreamError> {
@@ -194,6 +240,16 @@ impl StreamSource for FakeSource {
         _stream: &str,
         _from: &str,
         _block_ms: u64,
+        _count: usize,
+    ) -> Result<Vec<StreamEntry>, StreamError> {
+        self.queue.pop_front().unwrap_or_else(|| Ok(Vec::new()))
+    }
+
+    fn xrange(
+        &mut self,
+        _stream: &str,
+        _from: &str,
+        _to: &str,
         _count: usize,
     ) -> Result<Vec<StreamEntry>, StreamError> {
         self.queue.pop_front().unwrap_or_else(|| Ok(Vec::new()))

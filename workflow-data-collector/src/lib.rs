@@ -6,6 +6,7 @@
 //! §3.1–3.3 (flush/checkpoint/dedupe, startup repair, single-writer lock) and
 //! §9.1–9.2 (core pipeline) of `SPEC.md`.
 
+pub mod backfill;
 pub mod checkpoint;
 pub mod cli;
 pub mod config;
