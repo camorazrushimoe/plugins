@@ -269,7 +269,11 @@ pub fn run<S: StreamSource>(
     crate::cap::enforce(store.data_dir(), max_mb, (time.now)().into());
     // §5.4: MANIFEST at start of follow, reflecting the post-startup-trim
     // state (the manifest is rewritten again after every flushed batch).
-    crate::manifest::write(cfg)?;
+    // Observability is best-effort — a failed rewrite must not stop
+    // collection (same posture as cap::enforce, §5.5); the next flush retries.
+    if let Err(e) = crate::manifest::write(cfg) {
+        log::warn!("MANIFEST.json rewrite failed at start of follow: {e}");
+    }
     loop {
         if stop.load(Ordering::Relaxed) {
             log::info!("stop requested — clean exit at checkpoint {checkpoint}");
@@ -316,7 +320,11 @@ pub fn run<S: StreamSource>(
             // §5.4: MANIFEST rewritten each flush, after pairing upsert +
             // cap enforcement, so it reflects post-trim state (the drop-log
             // ring entries from this trim are persisted and visible).
-            crate::manifest::write(cfg)?;
+            // Best-effort: a failed observability write must not abort the
+            // flush loop (same posture as cap::enforce, §5.5).
+            if let Err(e) = crate::manifest::write(cfg) {
+                log::warn!("MANIFEST.json rewrite failed after flush: {e}");
+            }
         }
         // Common stop-contract tail — identical for every trigger (§3.4:
         // one clean path → flush+CHECKPOINT already done in `step` → exit 0).

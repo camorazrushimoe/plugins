@@ -143,31 +143,60 @@ pub fn redact_redis_url(url: &str) -> String {
     }
 }
 
+/// The crash-window gap: the highest `stream_id` actually written to the raw
+/// JSONL dataset. Mirrors `raw::Store::max_written_stream_id` (lines without
+/// a valid `stream_id` are skipped; a strictly-greater id replaces the best)
+/// but computed read-only from the scan's raw views — office + team. It never
+/// calls `Store::open`, whose `ensure_dir_0700` would create `raw/`+`teams/`
+/// and chmod an existing `data_dir`: `wfdc status` must not mutate the tree.
+fn max_written_stream_id(tree: &layout::DataDir) -> Option<String> {
+    let mut best: Option<(crate::streamid::StreamId, String)> = None;
+    for view in &tree.raw_views {
+        for line in &view.lines {
+            let Some(raw) = line.stream_id.as_deref() else {
+                continue;
+            };
+            let Some(parsed) = crate::streamid::StreamId::parse(raw) else {
+                continue;
+            };
+            let better = best.as_ref().is_none_or(|(cur, _)| parsed > *cur);
+            if better {
+                best = Some((parsed, raw.to_string()));
+            }
+        }
+    }
+    best.map(|(_, raw)| raw)
+}
+
 /// Map the durable CHECKPOINT ("0" = fresh) + highest written id onto the
 /// manifest's `checkpoint` / `last_flush_stream_id` fields.
 ///
 /// The crash-window rule is identical to `checkpoint::resume_start`:
 /// last_flush = max(durable CHECKPOINT, highest id written to JSONL), with
 /// the "0" sentinel mapped to `None` (a fresh/missing CHECKPOINT is null).
-fn checkpoint_fields(data_dir: &Path) -> Result<(Option<String>, Option<String>), Error> {
+fn checkpoint_fields(
+    data_dir: &Path,
+    tree: &layout::DataDir,
+) -> Result<(Option<String>, Option<String>), Error> {
     let durable = checkpoint::read(data_dir)?;
     let cp = if durable == "0" {
         None
     } else {
         Some(durable.clone())
     };
-    // Read-only scan of the highest id written to JSONL (crash-window gap).
-    let store = crate::raw::Store::open(data_dir)?;
-    let max_written = store.max_written_stream_id()?;
+    // Read-only: the highest written id comes from the scan, never from
+    // `Store::open` (which creates dirs / chmods — see `max_written_stream_id`).
+    let max_written = max_written_stream_id(tree);
     let last = checkpoint::resume_start(&durable, max_written.as_deref());
     let last_flush = if last == "0" { None } else { Some(last) };
     Ok((cp, last_flush))
 }
 
 /// Collect the manifest from on-disk state. Never touches Redis, never takes
-/// the single-writer lock, never runs startup repair — `wfdc status` must
-/// work while a collector holds the lock, and a missing `data_dir` yields
-/// the default manifest (§5.4).
+/// the single-writer lock, never runs startup repair, never writes the tree —
+/// `wfdc status` must work while a collector holds the lock, and a missing
+/// `data_dir` yields the default manifest without creating the directory
+/// (or `raw/`/`teams/` inside an existing one) (§5.4).
 pub fn collect(cfg: &Config) -> Result<Manifest, Error> {
     let mut m = Manifest {
         redis_url: redact_redis_url(&cfg.redis_url),
@@ -180,13 +209,14 @@ pub fn collect(cfg: &Config) -> Result<Manifest, Error> {
         return Ok(m);
     }
 
-    let (cp, last_flush) = checkpoint_fields(&cfg.data_dir)?;
+    // Disk scan first (read-only): office raw event counts + per-dt= bytes,
+    // the §5.5 bytes_used denominator (every *.jsonl under data_dir), and the
+    // crash-window gap (highest written stream id across the raw views).
+    let tree = layout::scan(&cfg.data_dir).map_err(|e| Error::Io(format!("scan data_dir: {e}")))?;
+    let (cp, last_flush) = checkpoint_fields(&cfg.data_dir, &tree)?;
     m.checkpoint = cp;
     m.last_flush_stream_id = last_flush;
 
-    // Disk scan: office raw event counts + per-dt= bytes, and the §5.5
-    // bytes_used denominator (every *.jsonl under data_dir).
-    let tree = layout::scan(&cfg.data_dir).map_err(|e| Error::Io(format!("scan data_dir: {e}")))?;
     m.bytes_used = tree.jsonl_bytes();
 
     let mut teams = BTreeSet::new();
@@ -331,19 +361,6 @@ mod tests {
     use crate::sessions::{SessionRow, State};
     use std::os::unix::fs::PermissionsExt;
 
-    fn tmpdir(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "wfdc-manifest-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
     fn cfg_for(dir: &std::path::Path, max_mb: u64) -> Config {
         Config {
             redis_url: "redis://127.0.0.1:6380".into(),
@@ -435,31 +452,30 @@ mod tests {
 
     #[test]
     fn write_creates_0600_manifest_atomically_and_redacts() {
-        let dir = tmpdir("write");
+        let dir = tempfile::tempdir().unwrap();
         let cfg = Config {
             redis_url: "redis://:pw@127.0.0.1:6380".into(),
             stream: "office:events".into(),
-            data_dir: dir.clone(),
+            data_dir: dir.path().to_path_buf(),
             max_mb: 500,
             expire_hours: 6,
         };
         write(&cfg).unwrap();
-        let p = dir.join(MANIFEST_FILE);
+        let p = dir.path().join(MANIFEST_FILE);
         assert!(p.exists());
-        assert!(!dir.join(format!("{MANIFEST_FILE}.tmp")).exists());
+        assert!(!dir.path().join(format!("{MANIFEST_FILE}.tmp")).exists());
         let mode = std::fs::metadata(&p).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "MANIFEST.json must be 0600 (§2)");
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(v["redis_url"], "redis://127.0.0.1:6380", "redacted in file");
         assert_eq!(v["max_mb"], 500);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn write_roundtrips_through_collect() {
-        let dir = tmpdir("roundtrip");
-        let cfg = cfg_for(&dir, 500);
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_for(dir.path(), 500);
         write(&cfg).unwrap();
         let again = collect(&cfg).unwrap();
         assert_eq!(again.plugin_version, env!("CARGO_PKG_VERSION"));
@@ -473,16 +489,15 @@ mod tests {
         assert!(again.drop_log.is_empty());
         assert!(again.discovered_teams.is_empty());
         assert_eq!(again.bytes_used, 0);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- collect on a hand-built tree ----------------------------------------
 
     #[test]
     fn collect_on_missing_data_dir_is_default() {
-        let dir = tmpdir("missing");
-        std::fs::remove_dir(&dir).unwrap();
-        let cfg = cfg_for(&dir, 500);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::remove_dir(dir.path()).unwrap();
+        let cfg = cfg_for(dir.path(), 500);
         let m = collect(&cfg).unwrap();
         assert_eq!(m.event_count, 0);
         assert_eq!(m.redis_url, "redis://127.0.0.1:6380");
@@ -491,41 +506,64 @@ mod tests {
         assert!(m.checkpoint.is_none(), "no dir → no checkpoint");
         assert!(m.last_flush_stream_id.is_none());
         // and it must NOT have created the dir (read-only contract)
-        assert!(!dir.exists(), "collect must never create data_dir");
+        assert!(!dir.path().exists(), "collect must never create data_dir");
+    }
+
+    #[test]
+    fn collect_on_pristine_existing_dir_creates_no_subdirs() {
+        // An existing-but-empty data_dir must stay untouched: the read-only
+        // contract covers raw/ + teams/ too (Store::open would create and
+        // chmod them — collect must not call it).
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_for(dir.path(), 500);
+        let m = collect(&cfg).unwrap();
+        assert_eq!(m.event_count, 0);
+        assert!(m.checkpoint.is_none());
+        assert!(m.last_flush_stream_id.is_none());
+        assert!(!dir.path().join("raw").exists(), "must not create raw/");
+        assert!(!dir.path().join("teams").exists(), "must not create teams/");
+        assert!(
+            !dir.path().join(MANIFEST_FILE).exists(),
+            "collect never writes"
+        );
     }
 
     #[test]
     fn collect_counts_events_dt_bytes_and_teams_excluding_non_jsonl() {
-        let dir = tmpdir("collect");
-        crate::raw::Store::open(&dir).unwrap();
-        std::fs::create_dir_all(dir.join("raw/dt=2026-08-31")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        crate::raw::Store::open(dir.path()).unwrap();
+        std::fs::create_dir_all(dir.path().join("raw/dt=2026-08-31")).unwrap();
         std::fs::write(
-            dir.join("raw/dt=2026-08-31/events.jsonl"),
+            dir.path().join("raw/dt=2026-08-31/events.jsonl"),
             "{\"stream_id\":\"1-0\",\"team\":\"dev-1\"}\n",
         )
         .unwrap();
-        std::fs::create_dir_all(dir.join("raw/dt=2026-09-01")).unwrap();
+        std::fs::create_dir_all(dir.path().join("raw/dt=2026-09-01")).unwrap();
         std::fs::write(
-            dir.join("raw/dt=2026-09-01/events.jsonl"),
+            dir.path().join("raw/dt=2026-09-01/events.jsonl"),
             "{\"stream_id\":\"2-0\",\"team\":\"Dev Team/1\"}\n",
         )
         .unwrap();
         // Non-JSONL files must never count toward bytes_used (§5.5).
-        std::fs::write(dir.join("MANIFEST.json"), "{\"bytes_used\":999999999}").unwrap();
-        std::fs::write(dir.join("CHECKPOINT"), "2-0\n").unwrap();
-        std::fs::write(dir.join(".lock"), "1 1\n").unwrap();
         std::fs::write(
-            dir.join("DROP_LOG.json"),
+            dir.path().join("MANIFEST.json"),
+            "{\"bytes_used\":999999999}",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("CHECKPOINT"), "2-0\n").unwrap();
+        std::fs::write(dir.path().join(".lock"), "1 1\n").unwrap();
+        std::fs::write(
+            dir.path().join("DROP_LOG.json"),
             "[{\"when\":\"w\",\"scope\":\"today\",\"stream_id\":\"9-9\",\"bytes_freed\":1}]",
         )
         .unwrap();
 
-        let cfg = cfg_for(&dir, 500);
+        let cfg = cfg_for(dir.path(), 500);
         let m = collect(&cfg).unwrap();
-        let f31 = std::fs::metadata(dir.join("raw/dt=2026-08-31/events.jsonl"))
+        let f31 = std::fs::metadata(dir.path().join("raw/dt=2026-08-31/events.jsonl"))
             .unwrap()
             .len();
-        let f01 = std::fs::metadata(dir.join("raw/dt=2026-09-01/events.jsonl"))
+        let f01 = std::fs::metadata(dir.path().join("raw/dt=2026-09-01/events.jsonl"))
             .unwrap()
             .len();
         assert_eq!(m.event_count, 2);
@@ -542,7 +580,6 @@ mod tests {
         // drop_log loaded from the persisted ring (unsanitized shape)
         assert_eq!(m.drop_log.len(), 1);
         assert_eq!(m.drop_log[0].stream_id.as_deref(), Some("9-9"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn sess_row(pk: &str, team: &str, state: State) -> SessionRow {
@@ -569,10 +606,10 @@ mod tests {
 
     #[test]
     fn collect_counts_all_five_states_from_hand_built_dir() {
-        let dir = tmpdir("five");
-        std::fs::create_dir_all(dir.join("raw/dt=2026-08-30")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("raw/dt=2026-08-30")).unwrap();
         std::fs::write(
-            dir.join("raw/dt=2026-08-30/events.jsonl"),
+            dir.path().join("raw/dt=2026-08-30/events.jsonl"),
             "{\"stream_id\":\"1-0\",\"team\":\"dev-1\"}\n",
         )
         .unwrap();
@@ -583,7 +620,7 @@ mod tests {
             sess_row("pk-o", "dev-1", State::Open),
             sess_row("pk-f", "dev-1", State::OrphanFinish),
         ];
-        let store = crate::sessions::SessionStore::new(&dir);
+        let store = crate::sessions::SessionStore::new(dir.path());
         let writes: Vec<_> = rows
             .iter()
             .map(|r| {
@@ -596,7 +633,7 @@ mod tests {
             })
             .collect();
         store.upsert(&writes).unwrap();
-        let cfg = cfg_for(&dir, 500);
+        let cfg = cfg_for(dir.path(), 500);
         let m = collect(&cfg).unwrap();
         assert_eq!(m.session_count, 5);
         for (k, want) in [
@@ -609,7 +646,6 @@ mod tests {
             assert_eq!(m.session_states.get(k), Some(&want), "state {k}");
         }
         assert!(m.discovered_teams.contains(&"dev-1".to_string()));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- human_lines ----------------------------------------------------------

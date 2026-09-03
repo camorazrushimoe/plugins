@@ -204,7 +204,11 @@ pub fn run<S: StreamSource>(
         // §5.4: MANIFEST once per run, after the final flush + cap
         // enforcement (the drop-log ring entries from this trim are persisted
         // and visible). A no-op run flushed nothing → no manifest rewrite.
-        crate::manifest::write(cfg)?;
+        // Best-effort: a failed observability write must not fail a backfill
+        // whose data is already durable (same posture as cap::enforce, §5.5).
+        if let Err(e) = crate::manifest::write(cfg) {
+            log::warn!("MANIFEST.json rewrite failed after backfill: {e}");
+        }
     }
 
     let checkpoint = new_cp
