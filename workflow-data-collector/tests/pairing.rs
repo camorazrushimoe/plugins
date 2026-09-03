@@ -146,6 +146,10 @@ impl Harness {
             self.clock += clock_step;
             self.clock
         };
+        let mut time = follow::LoopTime {
+            sleep: &mut sleeper,
+            now: &mut now,
+        };
         follow::run(
             &mut src,
             "office:events",
@@ -156,10 +160,9 @@ impl Harness {
                 ..Default::default()
             },
             &self.stop,
-            &mut sleeper,
+            &mut time,
             &mut pairer,
             &session_store,
-            &mut now,
         )
         .unwrap();
         self.stop.store(false, Ordering::Relaxed);
@@ -179,6 +182,10 @@ impl Harness {
             self.clock += clock_step;
             self.clock
         };
+        let mut time = follow::LoopTime {
+            sleep: &mut sleeper,
+            now: &mut now,
+        };
         follow::run(
             &mut src,
             "office:events",
@@ -189,10 +196,9 @@ impl Harness {
                 ..Default::default()
             },
             &self.stop,
-            &mut sleeper,
+            &mut time,
             &mut pairer,
             &session_store,
-            &mut now,
         )
         .unwrap();
         self.stop.store(false, Ordering::Relaxed);

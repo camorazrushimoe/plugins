@@ -109,14 +109,26 @@ fn real_main() -> Result<(), Error> {
     }
 
     match cli.command {
-        cli::Command::Follow => run_follow(cfg, store, &start),
+        cli::Command::Follow => run_follow(
+            cfg,
+            store,
+            &start,
+            cli.follow_max_reads(),
+            cli.max_idle_ms.map(|n| n as u64),
+        ),
         cli::Command::Backfill { from, to } => run_backfill(cfg, store, &start, &from, &to),
     }
 }
 
 /// Follow: install signal handlers, then block on the follow loop until a
 /// clean stop (1st SIGTERM/SIGINT → flush + exit 0; 2nd → exit 1).
-fn run_follow(cfg: Config, store: Store, start: &str) -> Result<(), Error> {
+fn run_follow(
+    cfg: Config,
+    store: Store,
+    start: &str,
+    max_reads: Option<usize>,
+    max_idle_ms: Option<u64>,
+) -> Result<(), Error> {
     // --- signals: 1st SIGTERM/SIGINT → clean stop, 2nd → immediate exit 1 ---
     let stop = Arc::new(AtomicBool::new(false));
     let signal_stop = Arc::clone(&stop);
@@ -147,7 +159,21 @@ fn run_follow(cfg: Config, store: Store, start: &str) -> Result<(), Error> {
     let mut store = store;
     // --- follow ----------------------------------------------------------------
     let mut redis = RedisStream::new(&cfg.redis_url)?;
-    let opts = FollowOptions::default();
+    // §3.4 stop contract: `--once` ≡ `--max-reads 1` (single source of truth:
+    // `CliArgs::follow_max_reads`); `--max-idle-ms` sets the idle window. The
+    // clean-stop path (flush → CHECKPOINT → exit 0) is identical for every
+    // trigger because `follow::run` exits through one code path; `--max-mb`
+    // enforcement itself lands with BON-69 (§5.5).
+    let opts = FollowOptions {
+        max_reads,
+        max_idle_ms,
+        ..Default::default()
+    };
+    log::info!(
+        "stop contract: max_reads={:?} max_idle_ms={:?}",
+        opts.max_reads,
+        opts.max_idle_ms
+    );
     // §5.3: the pairing pool is rebuilt from the session rows already on disk,
     // so an `open` / `interrupted` start from a previous run is still pairable
     // by a finish arriving after this restart (cross-batch pool persistence).
@@ -167,6 +193,10 @@ fn run_follow(cfg: Config, store: Store, start: &str) -> Result<(), Error> {
         }
     };
     let mut now = chrono::Utc::now;
+    let mut time = follow::LoopTime {
+        sleep: &mut sleep,
+        now: &mut now,
+    };
     follow::run(
         &mut redis,
         &cfg.stream,
@@ -174,10 +204,9 @@ fn run_follow(cfg: Config, store: Store, start: &str) -> Result<(), Error> {
         start,
         &opts,
         &stop,
-        &mut sleep,
+        &mut time,
         &mut pairer,
         &session_store,
-        &mut now,
     )?;
 
     log::info!("clean stop (checkpoint durable)");
