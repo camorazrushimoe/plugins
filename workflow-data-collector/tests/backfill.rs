@@ -769,16 +769,24 @@ fn follow_preserves_session_rows_from_earlier_backfill() {
         .args(["--redis", &redis_url(), "--stream", &tr.stream])
         .spawn()
         .expect("spawn follow");
+    // Wait for the assertion target itself — the session row rewritten as
+    // Completed — not just the CHECKPOINT: the checkpoint is durable inside
+    // the flush *before* the pairing upsert rewrites sessions.jsonl, so
+    // killing on the checkpoint alone could land in that window and leave the
+    // row Open (a race, not a semantic failure).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        if checkpoint_of(&dir).as_deref() == Some("1735000000001-0") {
+        let done = read_session_rows(&dir)
+            .first()
+            .is_some_and(|r| r.state == State::Completed);
+        if done {
             break;
         }
         if std::time::Instant::now() > deadline {
             child.kill().ok();
-            panic!("follow did not advance checkpoint to the finish id");
+            panic!("follow did not rewrite the session row to Completed");
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
     child.kill().ok();
     let _ = child.wait();
