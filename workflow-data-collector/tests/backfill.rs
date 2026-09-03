@@ -126,6 +126,7 @@ fn run_backfill(
     let session_store = SessionStore::new(&cfg.data_dir);
     let mut now = chrono::Utc::now;
     backfill::run(
+        cfg,
         &mut redis,
         &cfg.stream,
         &mut store,

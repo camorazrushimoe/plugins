@@ -56,6 +56,16 @@ fn real_main() -> Result<(), Error> {
     })
     .map_err(|e| Error::Config(e.0))?;
 
+    // §5.4: `wfdc status` is read-only observability. It never touches
+    // Redis, never takes the single-writer lock, never runs startup repair
+    // and never creates data_dir (a missing data_dir yields the default
+    // manifest). Dispatch it BEFORE Store::open / lock / repair / checkpoint
+    // read — and before the startup log line below (which prints the raw
+    // redis_url; status must not echo it even to stderr).
+    if let cli::Command::Status { json } = &cli.command {
+        return wfdc::manifest::status(&cfg, *json);
+    }
+
     log::info!(
         "wfdc starting: stream={} data_dir={} redis_url={} max_mb={} expire_hours={}",
         cfg.stream,
@@ -110,20 +120,23 @@ fn real_main() -> Result<(), Error> {
 
     match cli.command {
         cli::Command::Follow => run_follow(
-            cfg,
+            &cfg,
             store,
             &start,
             cli.follow_max_reads(),
             cli.max_idle_ms.map(|n| n as u64),
         ),
-        cli::Command::Backfill { from, to } => run_backfill(cfg, store, &start, &from, &to),
+        cli::Command::Backfill { from, to } => run_backfill(&cfg, store, &start, &from, &to),
+        cli::Command::Status { .. } => {
+            unreachable!("status is dispatched before Store::open (§5.4)")
+        }
     }
 }
 
 /// Follow: install signal handlers, then block on the follow loop until a
 /// clean stop (1st SIGTERM/SIGINT → flush + exit 0; 2nd → exit 1).
 fn run_follow(
-    cfg: Config,
+    cfg: &Config,
     store: Store,
     start: &str,
     max_reads: Option<usize>,
@@ -198,6 +211,7 @@ fn run_follow(
         now: &mut now,
     };
     follow::run(
+        cfg,
         &mut redis,
         &cfg.stream,
         &mut store,
@@ -217,12 +231,19 @@ fn run_follow(
 /// Backfill: one-shot chosen-range replay with the same writer/decoder/pairing
 /// rules as follow (§3.5). Dedupe and the resume point were already computed
 /// above (max of the durable CHECKPOINT and the highest id written to JSONL).
-fn run_backfill(cfg: Config, store: Store, start: &str, from: &str, to: &str) -> Result<(), Error> {
+fn run_backfill(
+    cfg: &Config,
+    store: Store,
+    start: &str,
+    from: &str,
+    to: &str,
+) -> Result<(), Error> {
     let mut store = store;
     let mut redis = RedisStream::new(&cfg.redis_url)?;
     let session_store = SessionStore::new(&cfg.data_dir);
     let mut now = chrono::Utc::now;
     backfill::run(
+        cfg,
         &mut redis,
         &cfg.stream,
         &mut store,

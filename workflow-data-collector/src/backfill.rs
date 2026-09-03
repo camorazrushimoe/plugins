@@ -37,6 +37,7 @@
 
 use chrono::{DateTime, Utc};
 
+use crate::config::Config;
 use crate::decode;
 use crate::pairing::Pairer;
 use crate::raw::{Store, WriteEntry};
@@ -100,9 +101,11 @@ fn after(id: &str) -> String {
 /// follow path does. `now` is the wall clock for §5.3 expiry, injected for
 /// tests. `max_mb` is the §5.5 disk cap (already normalized, spec §2); it is
 /// enforced after the run's single flush, exactly like follow enforces after
-/// every flush.
+/// every flush. `cfg` feeds the §5.4 MANIFEST hook: the manifest is rewritten
+/// once per run, after the final flush + cap enforcement.
 #[allow(clippy::too_many_arguments)] // the backfill run's collaborators are distinct seams (§2/§3/§5.3)
 pub fn run<S: StreamSource>(
+    cfg: &Config,
     source: &mut S,
     stream: &str,
     store: &mut Store,
@@ -198,6 +201,10 @@ pub fn run<S: StreamSource>(
     // wrote nothing, so there is nothing to enforce.
     if has_entries {
         crate::cap::enforce(store.data_dir(), max_mb, now().into());
+        // §5.4: MANIFEST once per run, after the final flush + cap
+        // enforcement (the drop-log ring entries from this trim are persisted
+        // and visible). A no-op run flushed nothing → no manifest rewrite.
+        crate::manifest::write(cfg)?;
     }
 
     let checkpoint = new_cp
@@ -271,6 +278,17 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    /// Test Config for a temp store dir (stream matches the fixture stream).
+    fn test_cfg(dir: &Path) -> Config {
+        Config {
+            redis_url: "redis://127.0.0.1:6380".into(),
+            stream: "office:events".into(),
+            data_dir: dir.to_path_buf(),
+            max_mb: 100_000,
+            expire_hours: 100_000,
+        }
+    }
+
     /// Drive `run` with a fresh store; returns the outcome.
     fn run_with(
         src: &mut FakeSource,
@@ -283,6 +301,7 @@ mod tests {
         let session_store = SessionStore::new(dir);
         let mut now = || frozen_clock();
         run(
+            &test_cfg(dir),
             src,
             "office:events",
             &mut store,
@@ -514,6 +533,7 @@ mod tests {
         let mut store = Store::open(dir.path()).unwrap();
         let mut now = || frozen_clock();
         let out = run(
+            &test_cfg(dir.path()),
             &mut src2,
             "office:events",
             &mut store,
@@ -557,6 +577,7 @@ mod tests {
         let mut store = Store::open(dir.path()).unwrap();
         let mut now = || frozen_clock();
         let out = run(
+            &test_cfg(dir.path()),
             &mut src,
             "office:events",
             &mut store,
@@ -592,6 +613,7 @@ mod tests {
         let mut store = Store::open(dir.path()).unwrap();
         let mut now = || frozen_clock();
         let out = run(
+            &test_cfg(dir.path()),
             &mut src,
             "office:events",
             &mut store,
@@ -630,6 +652,7 @@ mod tests {
         let mut store = Store::open(dir.path()).unwrap();
         let mut now = || frozen_clock();
         run(
+            &test_cfg(dir.path()),
             &mut src,
             "office:events",
             &mut store,
@@ -651,6 +674,7 @@ mod tests {
         let mut store2 = Store::open(dir.path()).unwrap();
         let mut now2 = || frozen_clock();
         let out = run(
+            &test_cfg(dir.path()),
             &mut src2,
             "office:events",
             &mut store2,
@@ -726,6 +750,7 @@ mod tests {
         let session_store = SessionStore::new(dir);
         let mut now = || frozen_clock();
         run(
+            &test_cfg(dir),
             src,
             "office:events",
             &mut store,
