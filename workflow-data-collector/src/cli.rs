@@ -24,6 +24,9 @@ pub struct CliArgs {
     /// `MS >= 0` (0 = immediate stop after the first read iteration).
     pub max_idle_ms: Option<i64>,
     pub help: bool,
+    /// `--version`: print the plugin version (the version MANIFEST.json
+    /// reports, §5.4 / §9.8) and exit 0.
+    pub version: bool,
     pub command: Command,
 }
 
@@ -39,6 +42,7 @@ impl Default for CliArgs {
             max_reads: None,
             max_idle_ms: None,
             help: false,
+            version: false,
             command: Command::Follow,
         }
     }
@@ -90,6 +94,7 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<CliArgs, String> {
             }
             "-h" | "--help" => out.help = true,
             "--once" => out.once = true,
+            "--version" => out.version = true,
             "--config" | "--redis" | "--stream" | "--max-mb" | "--expire-after" | "--max-reads"
             | "--max-idle-ms" => {
                 let value = it.next().ok_or_else(|| format!("{arg} requires a value"))?;
@@ -151,6 +156,13 @@ impl CliArgs {
     }
 }
 
+/// The `--version` line: `wfdc <crate version>`. The crate version in
+/// `Cargo.toml` is the plugin version the binary carries (§9.8) — the same
+/// version `MANIFEST.json` reports as `plugin_version` (§5.4).
+pub fn version_string() -> String {
+    format!("wfdc {}", env!("CARGO_PKG_VERSION"))
+}
+
 pub const USAGE: &str = "\
 wfdc — Workflow Data Collector (spec v0.3.0)
 
@@ -169,6 +181,7 @@ OPTIONS:
     --max-reads <N>       N XREAD batches (empty batches count), then clean stop (§3.4); N >= 1
     --max-idle-ms <MS>    Clean stop when no event arrives for MS (§3.4); MS >= 0 (0 = immediate)
     -h, --help            Print this help
+    --version             Print the plugin version (wfdc <crate version>)
 
 The default command is follow: blocking XREAD on the stream, writing the raw
 dataset to data_dir. SIGTERM/SIGINT flush and exit 0; a second signal exits 1.
@@ -227,6 +240,26 @@ mod tests {
     fn help_flag() {
         assert!(parse(argv(&["wfdc", "--help"])).unwrap().help);
         assert!(parse(argv(&["wfdc", "-h"])).unwrap().help);
+    }
+
+    #[test]
+    fn version_flag_parses() {
+        let c = parse(argv(&["wfdc", "--version"])).unwrap();
+        assert!(c.version);
+        assert!(!c.help);
+    }
+
+    #[test]
+    fn version_string_matches_crate_version() {
+        // §9.8: the binary carries the plugin version that MANIFEST.json
+        // reports — "wfdc <crate version>" (BIN-2 of the ship unit).
+        let v = version_string();
+        assert!(v.starts_with("wfdc "), "got {v:?}");
+        assert!(
+            v.contains(env!("CARGO_PKG_VERSION")),
+            "version_string {v:?} must contain crate version {}",
+            env!("CARGO_PKG_VERSION")
+        );
     }
 
     #[test]
