@@ -15,7 +15,7 @@ use crate::cli::CliArgs;
 pub const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6380";
 pub const DEFAULT_STREAM: &str = "office:events";
 pub const DEFAULT_DATA_DIR: &str = "./wfdc-data";
-pub const DEFAULT_MAX_MB: u64 = 500;
+pub const DEFAULT_MAX_MB: u64 = crate::max_mb::DEFAULT_MAX_MB;
 pub const DEFAULT_EXPIRE_HOURS: u64 = 6;
 
 /// Config file search order (§2): `--config`, `$WFDC_CONFIG`,
@@ -179,12 +179,9 @@ impl Config {
 }
 
 /// §2 normalization: 0/negative → 500, 1–15 → 16, else the value.
+/// Single source of truth: `max_mb::pin_max_mb` (spec §2, §5.5).
 pub fn normalize_max_mb(v: i64) -> u64 {
-    match v {
-        ..=0 => DEFAULT_MAX_MB,
-        1..=15 => 16,
-        n => n as u64,
-    }
+    crate::max_mb::pin_max_mb(Some(v))
 }
 
 fn resolve_data_dir(

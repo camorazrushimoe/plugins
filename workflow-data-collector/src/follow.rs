@@ -238,6 +238,10 @@ pub struct LoopTime<'a> {
 /// and the final iteration before a stop trigger exits — the pool is aged
 /// and the touched `sessions.jsonl` partitions are upserted. A clean stop
 /// never skips the pairing upsert/expiry (BUG-WFDC-007 seam).
+///
+/// `max_mb` is the §5.5 disk cap (already normalized, spec §2). It is
+/// enforced at the start of follow (the cap may have been lowered while the
+/// collector was stopped) and after every successful flush.
 #[allow(clippy::too_many_arguments)] // the follow loop's collaborators are all distinct seams (§2/§3/§5.3)
 pub fn run<S: StreamSource>(
     source: &mut S,
@@ -245,6 +249,7 @@ pub fn run<S: StreamSource>(
     store: &mut Store,
     initial_checkpoint: &str,
     opts: &FollowOptions,
+    max_mb: u64,
     stop: &AtomicBool,
     time: &mut LoopTime,
     pairer: &mut Pairer,
@@ -254,6 +259,8 @@ pub fn run<S: StreamSource>(
     let mut backoff = Backoff::new(opts.jitter);
     let mut reads: usize = 0;
     let mut last_event = (time.now)();
+    // §5.5: at start of follow, in case the cap was lowered while stopped.
+    crate::cap::enforce(store.data_dir(), max_mb, (time.now)().into());
     loop {
         if stop.load(Ordering::Relaxed) {
             log::info!("stop requested — clean exit at checkpoint {checkpoint}");
@@ -261,6 +268,7 @@ pub fn run<S: StreamSource>(
         }
         // §3.4: every read iteration (Idle or Flushed) is one XREAD batch and
         // is checked against the stop conditions; BackingOff is not a read.
+        let mut flushed = false;
         match step(
             source,
             stream,
@@ -273,6 +281,7 @@ pub fn run<S: StreamSource>(
             Step::Idle => reads += 1,
             Step::Flushed(_) => {
                 reads += 1;
+                flushed = true;
                 // Events arrived: reset the idle baseline so the timer
                 // measures silence since the last event.
                 last_event = (time.now)();
@@ -289,6 +298,13 @@ pub fn run<S: StreamSource>(
         pairer.age((time.now)());
         let writes = pairer.take_writes();
         session_store.upsert(&writes)?;
+        // §5.5: after every successful flush, enforce the cap — the raw
+        // batch, CHECKPOINT and this iteration's session upsert are all
+        // durable by now, so the trim sees the complete flush (a closed
+        // session row for a trimmed edge is removed, never re-written).
+        if flushed {
+            crate::cap::enforce(store.data_dir(), max_mb, (time.now)().into());
+        }
         // Common stop-contract tail — identical for every trigger (§3.4:
         // one clean path → flush+CHECKPOINT already done in `step` → exit 0).
         if max_reads_reached(opts, reads, &checkpoint) {
@@ -703,6 +719,7 @@ mod tests {
                 jitter: false,
                 ..Default::default()
             },
+            100_000, // max_mb: far above any fixture here — no cap in these tests
             &stop,
             &mut time,
             &mut pairer,
@@ -737,6 +754,7 @@ mod tests {
                 jitter: false,
                 ..Default::default()
             },
+            100_000, // max_mb: far above any fixture here — no cap in these tests
             &stop,
             &mut time,
             &mut pairer,
@@ -769,6 +787,7 @@ mod tests {
                 jitter: false,
                 ..Default::default()
             },
+            100_000, // max_mb: no cap in these tests
             &stop,
             &mut time,
             &mut pairer,
@@ -871,6 +890,7 @@ mod tests {
             store,
             initial_cp,
             opts,
+            100_000, // max_mb: no cap in these tests
             &stop,
             &mut time,
             &mut pairer,
@@ -984,6 +1004,7 @@ mod tests {
             &mut store,
             "0",
             &opts_with(Some(1), None),
+            100_000, // max_mb: no cap in these tests
             &stop,
             &mut time,
             &mut pairer,
@@ -1206,6 +1227,7 @@ mod tests {
             &mut store,
             "0",
             &opts_with(None, Some(0)),
+            100_000, // max_mb: no cap in these tests
             &stop,
             &mut time,
             &mut pairer,
@@ -1218,6 +1240,151 @@ mod tests {
             rows[0].state,
             crate::sessions::State::Expired,
             "expiry aging ran on the quiet idle round before the clean stop"
+        );
+    }
+
+    // --- §5.5 wiring: the cap is enforced at start of follow and after ----
+    // --- every successful flush.                                         ---
+
+    /// Write `raw/dt=<date>/events.jsonl` with at least `target_bytes` of
+    /// stream-id'd lines (the collector's raw shape) — a fixture big enough
+    /// to push a `max_mb=1` (1 MiB) cap over its limit.
+    fn seed_big_date(dir: &std::path::Path, date: &str, target_bytes: usize) {
+        let p = dir.join(format!("raw/dt={date}/events.jsonl"));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let line = "{\"stream_id\":\"1725062400000-0\",\"action\":\"task.started\",\"ts\":\"2026-08-30T00:00:00Z\",\"team\":\"dev-1\"}\n";
+        let mut content = String::with_capacity(target_bytes + 64);
+        while content.len() < target_bytes {
+            content.push_str(line);
+        }
+        std::fs::write(&p, content).unwrap();
+    }
+
+    /// A `task.started` entry with an explicit RFC 3339 timestamp, so the
+    /// decoded line lands in the `dt=` partition of that date.
+    fn entry_ts(id: &str, ts: &str) -> crate::stream::StreamEntry {
+        FakeSource::entry(
+            id,
+            &[
+                ("action", "task.started"),
+                ("actor", "dev"),
+                ("team", "dev-1"),
+                ("timestamp", ts),
+            ],
+        )
+    }
+
+    /// §5.5: at start of follow the cap is enforced (it may have been
+    /// lowered while the collector was stopped). Two dates over a 1 MiB cap
+    /// → the oldest date is deleted before any read happens.
+    #[test]
+    fn run_enforces_cap_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_big_date(dir.path(), "2026-08-30", 700_000);
+        seed_big_date(dir.path(), "2026-08-31", 700_000);
+        let mut store = Store::open(dir.path()).unwrap();
+        let mut src = FakeSource::new();
+        src.push(Ok(vec![])); // quiet stream → Idle, no flush
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stopper = {
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(120));
+                stop.store(true, Ordering::Relaxed);
+            })
+        };
+        let mut sleeper = |_: Duration| {}; // Idle → never called
+        let mut pairer = Pairer::new(6);
+        let session_store = SessionStore::new(dir.path());
+        let mut now = || chrono::Utc::now();
+        let mut time = LoopTime {
+            sleep: &mut sleeper,
+            now: &mut now,
+        };
+        run(
+            &mut src,
+            "office:events",
+            &mut store,
+            "0",
+            &FollowOptions {
+                jitter: false,
+                ..Default::default()
+            },
+            1, // max_mb: the two seeded dates together exceed 1 MiB
+            &stop,
+            &mut time,
+            &mut pairer,
+            &session_store,
+        )
+        .unwrap();
+        stopper.join().unwrap();
+        assert!(
+            !dir.path().join("raw/dt=2026-08-30/events.jsonl").exists(),
+            "startup enforcement deleted the oldest date"
+        );
+        assert!(
+            dir.path().join("raw/dt=2026-08-31/events.jsonl").is_file(),
+            "the newest date survives"
+        );
+    }
+
+    /// §5.5: after every successful flush the cap is enforced. The fixture
+    /// is *under* the cap at startup (no startup trim), and the flush pushes
+    /// it over → the oldest date is deleted only by the post-flush enforce.
+    #[test]
+    fn run_enforces_cap_after_every_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_big_date(dir.path(), "2026-08-30", 400_000);
+        seed_big_date(dir.path(), "2026-08-31", 400_000);
+        let mut store = Store::open(dir.path()).unwrap();
+        let mut src = FakeSource::new();
+        // One big batch (1500 events, ~0.4 MB) landing on 2026-08-31: the
+        // tree goes over the 1 MiB cap only after this flush.
+        let batch: Vec<crate::stream::StreamEntry> = (0..1500u64)
+            .map(|i| entry_ts(&format!("1725062400000-{i}"), "2026-08-31T10:00:00Z"))
+            .collect();
+        src.push(Ok(batch));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stopper = {
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(120));
+                stop.store(true, Ordering::Relaxed);
+            })
+        };
+        let mut sleeper = |_: Duration| {}; // no backoff in this script
+        let mut pairer = Pairer::new(6);
+        let session_store = SessionStore::new(dir.path());
+        let mut now = || chrono::Utc::now();
+        let mut time = LoopTime {
+            sleep: &mut sleeper,
+            now: &mut now,
+        };
+        run(
+            &mut src,
+            "office:events",
+            &mut store,
+            "0",
+            &FollowOptions {
+                jitter: false,
+                ..Default::default()
+            },
+            1, // max_mb: 1 MiB — the fixture is under it until the flush
+            &stop,
+            &mut time,
+            &mut pairer,
+            &session_store,
+        )
+        .unwrap();
+        stopper.join().unwrap();
+        assert!(
+            !dir.path().join("raw/dt=2026-08-30/events.jsonl").exists(),
+            "post-flush enforcement deleted the oldest date"
+        );
+        let lines = lines_in(dir.path());
+        assert!(
+            lines.iter().any(|l| l.contains("1725062400000-1499")),
+            "the flushed batch survives in the newer date"
         );
     }
 }
