@@ -10,6 +10,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::config::Config;
 use crate::decode;
 use crate::pairing::Pairer;
 use crate::raw::{Store, WriteEntry};
@@ -242,8 +243,13 @@ pub struct LoopTime<'a> {
 /// `max_mb` is the §5.5 disk cap (already normalized, spec §2). It is
 /// enforced at the start of follow (the cap may have been lowered while the
 /// collector was stopped) and after every successful flush.
+///
+/// `cfg` feeds the §5.4 MANIFEST flush hooks: the manifest is rewritten once
+/// at start (after the startup trim) and after every flushed batch (after
+/// pairing upsert + cap enforcement), so it reflects post-trim state.
 #[allow(clippy::too_many_arguments)] // the follow loop's collaborators are all distinct seams (§2/§3/§5.3)
 pub fn run<S: StreamSource>(
+    cfg: &Config,
     source: &mut S,
     stream: &str,
     store: &mut Store,
@@ -261,6 +267,13 @@ pub fn run<S: StreamSource>(
     let mut last_event = (time.now)();
     // §5.5: at start of follow, in case the cap was lowered while stopped.
     crate::cap::enforce(store.data_dir(), max_mb, (time.now)().into());
+    // §5.4: MANIFEST at start of follow, reflecting the post-startup-trim
+    // state (the manifest is rewritten again after every flushed batch).
+    // Observability is best-effort — a failed rewrite must not stop
+    // collection (same posture as cap::enforce, §5.5); the next flush retries.
+    if let Err(e) = crate::manifest::write(cfg) {
+        log::warn!("MANIFEST.json rewrite failed at start of follow: {e}");
+    }
     loop {
         if stop.load(Ordering::Relaxed) {
             log::info!("stop requested — clean exit at checkpoint {checkpoint}");
@@ -304,6 +317,14 @@ pub fn run<S: StreamSource>(
         // session row for a trimmed edge is removed, never re-written).
         if flushed {
             crate::cap::enforce(store.data_dir(), max_mb, (time.now)().into());
+            // §5.4: MANIFEST rewritten each flush, after pairing upsert +
+            // cap enforcement, so it reflects post-trim state (the drop-log
+            // ring entries from this trim are persisted and visible).
+            // Best-effort: a failed observability write must not abort the
+            // flush loop (same posture as cap::enforce, §5.5).
+            if let Err(e) = crate::manifest::write(cfg) {
+                log::warn!("MANIFEST.json rewrite failed after flush: {e}");
+            }
         }
         // Common stop-contract tail — identical for every trigger (§3.4:
         // one clean path → flush+CHECKPOINT already done in `step` → exit 0).
@@ -384,6 +405,18 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Test Config for a temp store dir (stream matches the fixture stream,
+    /// max_mb passed through so the manifest's max_mb field is honest).
+    fn test_cfg(dir: &std::path::Path, max_mb: u64) -> crate::config::Config {
+        crate::config::Config {
+            redis_url: "redis://127.0.0.1:6380".into(),
+            stream: "office:events".into(),
+            data_dir: dir.to_path_buf(),
+            max_mb,
+            expire_hours: 6,
+        }
     }
 
     /// Drive `step` until the fake's script is exhausted.
@@ -711,6 +744,7 @@ mod tests {
             now: &mut now,
         };
         run(
+            &test_cfg(dir.path(), 100_000),
             &mut src,
             "office:events",
             &mut store,
@@ -746,6 +780,7 @@ mod tests {
             now: &mut now,
         };
         run(
+            &test_cfg(dir.path(), 100_000),
             &mut src,
             "office:events",
             &mut store,
@@ -779,6 +814,7 @@ mod tests {
             now: &mut now,
         };
         run(
+            &test_cfg(dir.path(), 100_000),
             &mut src,
             "office:events",
             &mut store,
@@ -885,6 +921,7 @@ mod tests {
         let mut pairer = Pairer::new(6);
         let session_store = SessionStore::new(store.data_dir());
         run(
+            &test_cfg(store.data_dir(), 100_000),
             src,
             "office:events",
             store,
@@ -999,6 +1036,7 @@ mod tests {
         let mut pairer = Pairer::new(6);
         let session_store = SessionStore::new(dir.path());
         run(
+            &test_cfg(dir.path(), 100_000),
             &mut src,
             "office:events",
             &mut store,
@@ -1222,6 +1260,7 @@ mod tests {
         let mut pairer = Pairer::new(1); // 1h expiry window
         pairer.rebuild(session_store.load_all().unwrap());
         run(
+            &test_cfg(dir.path(), 100_000),
             &mut src,
             "office:events",
             &mut store,
@@ -1302,6 +1341,7 @@ mod tests {
             now: &mut now,
         };
         run(
+            &test_cfg(dir.path(), 1),
             &mut src,
             "office:events",
             &mut store,
@@ -1348,7 +1388,11 @@ mod tests {
         let stopper = {
             let stop = std::sync::Arc::clone(&stop);
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(120));
+                // Startup now also rewrites MANIFEST (§5.4, BON-70) — a
+                // collect over the seeded tree — so give the startup + flush
+                // margin to finish before the stop fires (the flush must land
+                // for the post-flush enforce to be observable).
+                std::thread::sleep(Duration::from_millis(1500));
                 stop.store(true, Ordering::Relaxed);
             })
         };
@@ -1361,6 +1405,7 @@ mod tests {
             now: &mut now,
         };
         run(
+            &test_cfg(dir.path(), 1),
             &mut src,
             "office:events",
             &mut store,

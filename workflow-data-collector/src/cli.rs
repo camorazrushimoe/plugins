@@ -45,7 +45,8 @@ impl Default for CliArgs {
 }
 
 /// The invoked subcommand. `follow` is the default; `backfill` replays a
-/// chosen stream range (§3.5, §9 item 7).
+/// chosen stream range (§3.5, §9 item 7); `status` prints the §5.4
+/// observability document (read-only, no Redis, no lock).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Follow,
@@ -54,6 +55,11 @@ pub enum Command {
         from: String,
         /// Last stream id of the range, inclusive (default `+` = stream end).
         to: String,
+    },
+    /// `wfdc status [--json]` (§5.4): human `key: value` lines, or one JSON
+    /// document with `--json` (stable key order, no trailing prose).
+    Status {
+        json: bool,
     },
 }
 
@@ -87,6 +93,18 @@ pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<CliArgs, String> {
                     }
                 }
                 out.command = Command::Backfill { from, to };
+            }
+            // `status` consumes the rest of the line: --json is the only
+            // status flag (global flags precede the subcommand, §5.4).
+            "status" => {
+                let mut json = false;
+                for flag in it.by_ref() {
+                    match flag.as_str() {
+                        "--json" => json = true,
+                        other => return Err(format!("unknown argument {other:?}")),
+                    }
+                }
+                out.command = Command::Status { json };
             }
             "-h" | "--help" => out.help = true,
             "--once" => out.once = true,
@@ -158,6 +176,7 @@ USAGE:
     wfdc [OPTIONS]
     wfdc [OPTIONS] follow
     wfdc [OPTIONS] backfill [--from STREAM_ID] [--to STREAM_ID]
+    wfdc [OPTIONS] status [--json]
 
 OPTIONS:
     --config <PATH>       Config file (else $WFDC_CONFIG, <binary-dir>/wfdc.toml, ./wfdc.toml)
@@ -181,6 +200,12 @@ forward only, and an inverted/empty range writes nothing and exits 0.
 
 All stop triggers share one clean-stop path: flush → CHECKPOINT → exit 0
 (the max_mb cap step lands with the disk-cap feature, §5.5).
+
+status prints the MANIFEST observability document (§5.4): human
+`key: value` lines, or one JSON document with `--json` (stable key order,
+no trailing prose). Read-only — it never connects to Redis and never takes
+the single-writer lock, so it works while a collector is running on the
+same data_dir.
 ";
 
 #[cfg(test)]
@@ -246,8 +271,34 @@ mod tests {
 
     #[test]
     fn unknown_subcommand_is_error() {
-        // status arrives with its own ticket (BON-70)
-        assert!(parse(argv(&["wfdc", "status"])).is_err());
+        // "frobnicate" is not a subcommand — only follow/backfill/status are.
+        assert!(parse(argv(&["wfdc", "frobnicate"])).is_err());
+    }
+
+    #[test]
+    fn status_subcommand_is_accepted() {
+        // status arrives with its own ticket (BON-70): it is a first-class
+        // subcommand now, no longer an unknown-argument error.
+        assert_eq!(
+            parse(argv(&["wfdc", "status"])).unwrap().command,
+            Command::Status { json: false }
+        );
+        assert_eq!(
+            parse(argv(&["wfdc", "status", "--json"])).unwrap().command,
+            Command::Status { json: true }
+        );
+        assert_eq!(
+            parse(argv(&["wfdc", "--redis", "redis://x:1", "status"]))
+                .unwrap()
+                .command,
+            Command::Status { json: false },
+            "global flags precede the subcommand"
+        );
+    }
+
+    #[test]
+    fn status_unknown_flag_is_error() {
+        assert!(parse(argv(&["wfdc", "status", "--nope"])).is_err());
     }
 
     #[test]
