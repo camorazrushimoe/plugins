@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 
+use wfdc::config::Config;
 use wfdc::follow::{self, FollowOptions};
 use wfdc::pairing::Pairer;
 use wfdc::raw::Store;
@@ -133,9 +134,20 @@ impl Harness {
         }
     }
 
+    fn cfg(&self) -> Config {
+        Config {
+            redis_url: "redis://127.0.0.1:6380".into(),
+            stream: "office:events".into(),
+            data_dir: self.dir.path().to_path_buf(),
+            max_mb: 100_000,
+            expire_hours: 6,
+        }
+    }
+
     /// Run the follow loop to completion on a scripted source. `clock_step`
     /// advances the wall clock by this much per read iteration.
     fn run_script(&mut self, script: impl FnOnce(&mut Scripted), clock_step: Duration) {
+        let cfg = self.cfg();
         let mut store = Store::open(self.dir.path()).unwrap();
         let session_store = SessionStore::new(self.dir.path());
         let mut pairer = Pairer::new(6); // default expiry window
@@ -151,6 +163,7 @@ impl Harness {
             now: &mut now,
         };
         follow::run(
+            &cfg,
             &mut src,
             "office:events",
             &mut store,
@@ -172,6 +185,7 @@ impl Harness {
     /// Run with a fresh pairer rebuilt from the sessions already on disk
     /// (simulates a restart, §5.3 pool persistence).
     fn run_restarted(&mut self, script: impl FnOnce(&mut Scripted), clock_step: Duration) {
+        let cfg = self.cfg();
         let mut store = Store::open(self.dir.path()).unwrap();
         let session_store = SessionStore::new(self.dir.path());
         let mut pairer = Pairer::new(6);
@@ -188,6 +202,7 @@ impl Harness {
             now: &mut now,
         };
         follow::run(
+            &cfg,
             &mut src,
             "office:events",
             &mut store,

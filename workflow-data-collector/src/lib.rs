@@ -19,6 +19,7 @@ pub mod follow;
 pub mod fsutil;
 pub mod layout;
 pub mod lock;
+pub mod manifest;
 pub mod max_mb;
 pub mod pairing;
 pub mod raw;
