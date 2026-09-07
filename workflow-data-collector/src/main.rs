@@ -42,6 +42,10 @@ fn real_main() -> Result<(), Error> {
         print!("{}", cli::USAGE);
         return Ok(());
     }
+    if cli.version {
+        println!("{}", cli::version_string());
+        return Ok(());
+    }
     let env: BTreeMap<String, String> = std::env::vars().collect();
     let binary_dir = std::env::current_exe()
         .ok()

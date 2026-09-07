@@ -33,6 +33,24 @@ factory, no changes to its code.
 Plugins are developed **spec-driven**: the specification (`SPEC.md`) is written
 first and is the source of truth. Implementation follows the spec.
 
+## Ship unit (build & verify)
+
+The install unit is a **reproducible static musl binary** (SPEC §9.8).
+`workflow-data-collector/build.sh` builds it with a **pinned toolchain**
+(`rustup 1.98.0` + `x86_64-unknown-linux-musl` — no `latest` drift) and
+records the binary's sha256 in `workflow-data-collector/bin/SHA256SUMS`:
+
+```bash
+./workflow-data-collector/build.sh
+./workflow-data-collector/verify-ship-unit.sh          # static / sha256 / version checks
+./workflow-data-collector/verify-ship-unit.sh --repro  # + two-clean-build reproducibility
+```
+
+Two clean builds of the same commit in the pinned toolchain produce
+byte-identical binaries (identical sha256). `workflow-data-collector/bin/wfdc`
+is the committed install unit; the version it reports is the same version
+`MANIFEST.json` carries as `plugin_version` (SPEC §5.4).
+
 ## Layout
 
 ```
