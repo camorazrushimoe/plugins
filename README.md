@@ -15,6 +15,17 @@ Installing a plugin = drop a single compiled binary next to the factory, add
 a small config file that points at Redis, and run it. No rebuild of the
 factory, no changes to its code.
 
+## Install
+
+Each plugin ships an `INSTALL.md` with copy-pasteable steps. The short version:
+download the static binary from this repo, write a 4-line `wfdc.toml` pointing
+at your factory's Redis, run it. See
+[workflow-data-collector/INSTALL.md](workflow-data-collector/INSTALL.md).
+
+For the workflow-data-collector, the install unit is
+[`workflow-data-collector/bin/wfdc`](workflow-data-collector/bin/wfdc) (static
+musl binary) + [`workflow-data-collector/wfdc.toml.example`](workflow-data-collector/wfdc.toml.example).
+
 ## Plugin contract
 
 - **Language:** Rust.
@@ -68,4 +79,4 @@ Each plugin folder will contain its source (`src/`) and prebuilt binaries
 
 | Plugin | What it does | Status |
 |--------|--------------|--------|
-| [workflow-data-collector](workflow-data-collector/) | Reads the factory Redis stream and writes a raw JSONL dataset plus paired agent sessions. Lab analyses the files. | Specification v0.3.0 |
+| [workflow-data-collector](workflow-data-collector/) — [install](workflow-data-collector/INSTALL.md) | Reads the factory Redis stream and writes a raw JSONL dataset plus paired agent sessions. Lab analyses the files. | v0.3.0 (7/7 tickets shipped) |
